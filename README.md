@@ -363,6 +363,37 @@ Regression tests do not move hardware.
     flatengine doctor
     flatengine stamp --help
 
+## Ekos Post-Capture Integration
+
+FlatEngine includes:
+
+    session-postcapture.py
+
+This script is intended to be configured as the Ekos Capture
+post-capture script for light frames.
+
+Its job is only to stamp the observing-night `SESSION` keyword
+into each newly captured FITS file.
+
+It does not run flats or perform calibration during imaging.
+
+The observing-night ID uses the same noon-rollover convention
+as FlatEngine, so images captured after midnight remain part of
+the previous evening's session.
+
+Typical workflow:
+
+    Ekos captures light
+        ->
+    session-postcapture.py stamps SESSION
+        ->
+    imaging continues normally
+        ->
+    shutdown queue runs flatengine nightly
+
+If `SESSION` is absent, FlatEngine can fall back to `DATE-OBS`,
+but using the post-capture script is preferred.
+
 ## Session Handling
 
 FlatEngine prefers the FITS keyword:
