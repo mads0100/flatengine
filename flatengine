@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="${HOME}/.local/share/flatengine/scripts"
+
+usage() {
+    cat <<'EOF'
+FlatEngine
+
+Usage:
+  flatengine setup
+  flatengine plan [options]
+  flatengine nightly [options]
+  flatengine calibrate [options]
+  flatengine execute [options]
+  flatengine regression
+  flatengine doctor
+  flatengine stamp [options]
+  flatengine help
+EOF
+}
+
+cmd="${1:-help}"
+
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+
+case "${cmd}" in
+    setup)
+        exec python3 "${SCRIPT_DIR}/flat-setup.py" "$@"
+        ;;
+    plan)
+        exec python3 "${SCRIPT_DIR}/flats-plan.py" "$@"
+        ;;
+    nightly)
+        exec python3 "${SCRIPT_DIR}/flats-nightly.py" "$@"
+        ;;
+    calibrate)
+        exec python3 "${SCRIPT_DIR}/flat-calibrate.py" "$@"
+        ;;
+    execute)
+        exec python3 "${SCRIPT_DIR}/flats-execute.py" "$@"
+        ;;
+    regression)
+        exec python3 "${SCRIPT_DIR}/flats-regression.py" "$@"
+        ;;
+    doctor)
+        exec python3 "${SCRIPT_DIR}/flat-doctor.py" "$@"
+        ;;
+    stamp)
+        exec python3 "${SCRIPT_DIR}/session-stamp.py" "$@"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        echo "Unknown FlatEngine command: ${cmd}" >&2
+        echo >&2
+        usage >&2
+        exit 2
+        ;;
+esac
