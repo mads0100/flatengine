@@ -1035,6 +1035,7 @@ def build_darkflat_queue(
     exposure,
     config,
     dark_dir=None,
+    count=None,
 ):
     tree = ET.parse(TEMPLATE)
     root = tree.getroot()
@@ -1046,9 +1047,10 @@ def build_darkflat_queue(
     type_node = job.find("Type")
     type_node.text = "Dark"
 
-    job.find("Count").text = str(
-        config["frames"]["flats_per_group"]
-    )
+    if count is None:
+        count = config["frames"]["flats_per_group"]
+
+    job.find("Count").text = str(int(count))
 
     target_name = job.find("TargetName")
     if target_name is not None:
@@ -1286,6 +1288,7 @@ def write_run_manifest(
     flat_levels=None,
     target_adu=None,
     darkflat_library=None,
+    darkflats_pending=False,
 ):
     manifest = {
         "session": session,
@@ -1307,6 +1310,7 @@ def write_run_manifest(
             if darkflat_library is not None
             else None
         ),
+        "darkflats_pending": bool(darkflats_pending),
         "status": "complete",
         "flats": [
             str(path)
@@ -1789,12 +1793,18 @@ def acquire_darkflats(
     config,
 ):
     """
-    Return (darkflat_files, library_dir_or_None).
+    Return (darkflat_files, library_dir_or_None, pending).
 
     With the library enabled (default), dark-flats are reused
-    from a library keyed on camera state and exposure; they are
-    captured only when no complete library exists. A light-leak
-    check guards every new capture.
+    from a library keyed on camera state and exposure. When no
+    complete library exists, darkflat_library.on_missing decides:
+
+      "notify"  (default) record the request, send a Pushover
+                message and continue without dark-flats; build
+                it later with `flatengine darkflats --build`
+      "capture" capture the library now, unattended
+
+    A light-leak check guards every new capture.
     """
     lib_cfg = config.get(
         "darkflat_library",
@@ -1864,7 +1874,82 @@ def acquire_darkflats(
                 f"Library frames: {len(existing)}"
             )
 
-            return existing, library_dir
+            return existing, library_dir, False
+
+        on_missing = str(
+            lib_cfg.get(
+                "on_missing",
+                "notify",
+            )
+        ).lower()
+
+        if on_missing == "notify":
+            step = float(
+                lib_cfg.get(
+                    "temperature_step_c",
+                    5,
+                )
+            )
+
+            details = {
+                "camera": camera,
+                "gain": gain,
+                "offset": offset,
+                "xbin": xbin,
+                "ybin": ybin,
+                "exposure": float(exposure),
+                "lownoise": lownoise,
+                "temperature_band_c": (
+                    None
+                    if ccd_temp is None
+                    else round(float(ccd_temp) / step) * step
+                ),
+                "count": count,
+                "profile": profile,
+            }
+
+            record, due = fc.record_pending_darkflats(
+                library_dir,
+                details,
+                session,
+                repeat_hours=config.get(
+                    "notify",
+                    {},
+                ).get(
+                    "repeat_hours",
+                    24,
+                ),
+            )
+
+            print(
+                "No dark-flat library for this exposure. "
+                "Recorded as pending (not captured):"
+            )
+            print(
+                f"  {fc.describe_pending(record)}"
+            )
+            print(
+                f"  {library_dir}"
+            )
+            print(
+                "Build it after dark with: "
+                "flatengine darkflats --build"
+            )
+
+            if due:
+                fc.notify(
+                    config,
+                    "FlatEngine: dark-flats needed",
+                    (
+                        f"No library for {profile} flats "
+                        f"(session {session}).\n"
+                        f"Shoot {fc.describe_pending(record)}.\n"
+                        "After dark, front end covered: "
+                        "flatengine darkflats --build"
+                    ),
+                )
+
+            return [], library_dir, True
 
         print(
             f"No complete library; building: {library_dir}"
@@ -1884,6 +1969,7 @@ def acquire_darkflats(
         exposure=exposure,
         config=config,
         dark_dir=library_dir,
+        count=count,
     )
 
     print(
@@ -1922,6 +2008,18 @@ def acquire_darkflats(
     )
 
     if leak["suspected"]:
+        fc.notify(
+            config,
+            "FlatEngine: light leak in dark-flats",
+            (
+                f"{exposure:g} s dark-flats rejected: channel "
+                f"spread {leak['channel_spread_adu']} ADU, center "
+                f"minus corners {leak['center_minus_corners_adu']} "
+                "ADU. Not added to the library."
+            ),
+            priority=1,
+        )
+
         raise RuntimeError(
             "LIGHT LEAK SUSPECTED IN DARK-FLATS\n"
             f"Channel spread {leak['channel_spread_adu']} ADU, "
@@ -1944,7 +2042,9 @@ def acquire_darkflats(
             f"Library registered: {manifest}"
         )
 
-    return darkflat_files, library_dir
+        fc.clear_pending(library_dir)
+
+    return darkflat_files, library_dir, False
 
 
 
@@ -2273,6 +2373,7 @@ def main():
 
     darkflat_files = []
     library_dir = None
+    darkflats_pending = False
 
     if config[
         "frames"
@@ -2280,7 +2381,7 @@ def main():
         "darkflats_enabled",
         True
     ):
-        darkflat_files, library_dir = acquire_darkflats(
+        darkflat_files, library_dir, darkflats_pending = acquire_darkflats(
             session=args.session,
             profile=profile,
             camera=camera,
@@ -2321,6 +2422,7 @@ def main():
         ),
         target_adu=target_adu,
         darkflat_library=library_dir,
+        darkflats_pending=darkflats_pending,
     )
 
     print()
@@ -2343,7 +2445,11 @@ def main():
         f"Flats:      {flat_dir}"
     )
 
-    if darkflat_files:
+    if darkflats_pending:
+        print(
+            f"Dark-flats: PENDING (library not built): {library_dir}"
+        )
+    elif darkflat_files:
         print(
             "Dark-flats: "
             + str(

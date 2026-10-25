@@ -247,6 +247,51 @@ libraries after dark, with the front end covered.
 Set `darkflat_library.enabled` to false to restore per-group
 dark-flats.
 
+### Missing libraries: notify instead of capture
+
+By default (`darkflat_library.on_missing: "notify"`) a nightly run
+does **not** shoot a missing library unattended. It finishes the
+flats, records the request, and sends a Pushover message such as:
+
+    FlatEngine: dark-flats needed
+    Shoot 30 x 30 s  G100 O40 B1x1  LowNoise ON  ~-10 C.
+    After dark, front end covered: flatengine darkflats --build
+
+The group's manifest records `darkflats_pending: true`. Set
+`on_missing: "capture"` to shoot missing libraries immediately.
+
+Manage the library with:
+
+    flatengine darkflats                        # list pending
+    flatengine darkflats --build                # capture all pending
+    flatengine darkflats --build --exposure 30  # just one
+    flatengine darkflats --add 1 2 30 --like some_flat.fits
+                                                # pre-request libraries
+    flatengine darkflats --test-notify          # check Pushover
+
+`--build` asks for confirmation that it is dark and the front end
+is covered, verifies the captured frames match the requested camera
+state (gain, offset, LOWNOISE, temperature band), runs the leak
+check, and registers the library only if everything passes.
+
+### Pushover
+
+Add credentials to `flat-config.json`:
+
+    "notify": {
+      "pushover": {
+        "user_key": "<your user key>",
+        "app_token": "<your application token>"
+      },
+      "repeat_hours": 24
+    }
+
+or set `FLATENGINE_PUSHOVER_USER` and `FLATENGINE_PUSHOVER_TOKEN`.
+Without credentials, notifications are printed instead. Pending
+reminders repeat at most every `repeat_hours`. FlatEngine also
+notifies on a light-leak rejection, on a nightly abort, and when
+libraries finish building. A failed notification never stops a run.
+
 ## Manual Filters
 
 FlatEngine supports the Ekos Manual Filter driver.

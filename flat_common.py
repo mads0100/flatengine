@@ -11,6 +11,9 @@ import json
 import os
 import re
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import numpy as np
 
@@ -1003,3 +1006,211 @@ def light_leak_report(data, threshold_adu=5.0):
         "corner_adu": [round(value, 2) for value in corners],
         "threshold_adu": float(threshold_adu),
     }
+
+
+# ---------------------------------------------------------------------
+# Pending dark-flat libraries
+#
+# With darkflat_library.on_missing = "notify" (default), a missing
+# library is recorded here instead of being captured unattended.
+# `flatengine darkflats --build` captures everything listed.
+# ---------------------------------------------------------------------
+
+PENDING_FILE = STATE_DIR / "darkflats-pending.json"
+
+
+def load_pending():
+    if not PENDING_FILE.exists():
+        return {}
+
+    try:
+        return json.loads(PENDING_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_pending(pending):
+    PENDING_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    PENDING_FILE.write_text(
+        json.dumps(
+            pending,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def record_pending_darkflats(
+    library_dir,
+    details,
+    session,
+    repeat_hours=24.0,
+):
+    """
+    Add or refresh a pending library request.
+
+    Returns (record, notify_due). notify_due is True the first
+    time a library is requested and again once repeat_hours have
+    passed since the last notification.
+    """
+    pending = load_pending()
+
+    key = str(library_dir)
+    now = time.time()
+
+    record = pending.get(key)
+
+    if record is None:
+        record = dict(details)
+        record.update(
+            {
+                "library_dir": key,
+                "first_requested": time.strftime(
+                    "%Y-%m-%dT%H:%M:%S"
+                ),
+                "sessions": [],
+                "last_notified_epoch": None,
+            }
+        )
+
+    if session not in record["sessions"]:
+        record["sessions"].append(session)
+
+    last = record.get("last_notified_epoch")
+
+    notify_due = (
+        last is None
+        or now - float(last) >= float(repeat_hours) * 3600.0
+    )
+
+    if notify_due:
+        record["last_notified_epoch"] = now
+
+    pending[key] = record
+    save_pending(pending)
+
+    return record, notify_due
+
+
+def clear_pending(library_dir):
+    pending = load_pending()
+
+    if pending.pop(str(library_dir), None) is not None:
+        save_pending(pending)
+        return True
+
+    return False
+
+
+def describe_pending(record):
+    return (
+        f"{record.get('count', 30)} x {float(record['exposure']):g} s  "
+        f"G{record.get('gain')} O{record.get('offset')} "
+        f"B{record.get('xbin')}x{record.get('ybin')}  "
+        f"LowNoise {record.get('lownoise') or 'n/a'}  "
+        f"~{record.get('temperature_band_c', 'n/a')} C"
+    )
+
+
+# ---------------------------------------------------------------------
+# Pushover notifications
+# ---------------------------------------------------------------------
+
+PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
+
+
+def pushover_credentials(config):
+    """
+    Credentials come from config notify.pushover.{user_key,app_token}
+    or the FLATENGINE_PUSHOVER_USER / FLATENGINE_PUSHOVER_TOKEN
+    environment variables. Returns None when not configured.
+    """
+    settings = config.get(
+        "notify",
+        {},
+    ).get(
+        "pushover",
+        {},
+    )
+
+    if settings.get("enabled", True) is False:
+        return None
+
+    user = (
+        os.environ.get("FLATENGINE_PUSHOVER_USER")
+        or settings.get("user_key")
+    )
+
+    token = (
+        os.environ.get("FLATENGINE_PUSHOVER_TOKEN")
+        or settings.get("app_token")
+    )
+
+    if not user or not token:
+        return None
+
+    return user, token
+
+
+def notify(
+    config,
+    title,
+    message,
+    priority=0,
+    opener=None,
+):
+    """
+    Send a Pushover notification. Never raises: a failed
+    notification must not abort calibration. Returns True on
+    success, False when unconfigured or on failure.
+    """
+    credentials = pushover_credentials(config)
+
+    if credentials is None:
+        print(
+            "Pushover not configured; notification printed only:"
+        )
+        print(f"  {title}: {message}")
+        return False
+
+    user, token = credentials
+
+    data = urllib.parse.urlencode(
+        {
+            "token": token,
+            "user": user,
+            "title": title[:250],
+            "message": message[:1024],
+            "priority": int(priority),
+        }
+    ).encode()
+
+    request = urllib.request.Request(
+        PUSHOVER_URL,
+        data=data,
+        method="POST",
+    )
+
+    try:
+        open_url = opener or urllib.request.urlopen
+
+        with open_url(request, timeout=10) as response:
+            body = json.loads(
+                response.read().decode() or "{}"
+            )
+
+        if body.get("status") == 1:
+            print(f"Pushover sent: {title}")
+            return True
+
+        print(f"Pushover rejected the message: {body}")
+        return False
+
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"Pushover failed ({exc}); continuing.")
+        return False

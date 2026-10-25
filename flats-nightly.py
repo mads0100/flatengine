@@ -612,6 +612,29 @@ def main():
         failures=0,
     )
 
+    print_pending_darkflats()
+
+
+def print_pending_darkflats():
+    pending = fc.load_pending()
+
+    if not pending:
+        return
+
+    print()
+    print("DARK-FLAT LIBRARIES STILL NEEDED")
+
+    for record in sorted(
+        pending.values(),
+        key=lambda r: float(r["exposure"]),
+    ):
+        print(f"  {fc.describe_pending(record)}")
+
+    print(
+        "Build after dark, front end covered: "
+        "flatengine darkflats --build"
+    )
+
 
 if __name__ == "__main__":
     try:
@@ -624,6 +647,17 @@ if __name__ == "__main__":
         print("=" * 72)
         print(str(e).strip())
         print("=" * 72)
+
+        try:
+            fc.notify(
+                json.loads(fc.CONFIG_FILE.read_text()),
+                "FlatEngine: nightly run aborted",
+                str(e).strip()[:900],
+                priority=1,
+            )
+        except Exception:
+            pass
+
         raise SystemExit(2)
 
     except KeyboardInterrupt:

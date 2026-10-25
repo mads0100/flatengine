@@ -344,6 +344,77 @@ def fixed_exposure_checks():
         "very weak channel is capped at the maximum",
     )
 
+    # Pending dark-flat records and Pushover, isolated in a temp dir.
+    import io
+    import json as _json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = fc.PENDING_FILE
+        fc.PENDING_FILE = Path(tmp) / "pending.json"
+
+        try:
+            details = {"exposure": 30.0, "gain": 100, "offset": 40,
+                       "xbin": 1, "ybin": 1, "count": 30}
+
+            _, due = fc.record_pending_darkflats(
+                Path(tmp) / "lib30", details, "20261025",
+            )
+            check(due, "first pending request notifies")
+
+            record, due = fc.record_pending_darkflats(
+                Path(tmp) / "lib30", details, "20261026",
+            )
+            check(
+                not due and record["sessions"] == ["20261025", "20261026"],
+                "repeat request within window does not re-notify",
+            )
+
+            check(
+                fc.clear_pending(Path(tmp) / "lib30")
+                and fc.load_pending() == {},
+                "building a library clears its request",
+            )
+        finally:
+            fc.PENDING_FILE = saved
+
+    sent = {}
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_open(request, timeout=10):
+        sent["data"] = request.data.decode()
+        return FakeResponse(_json.dumps({"status": 1}).encode())
+
+    push_cfg = {"notify": {"pushover": {"user_key": "u1", "app_token": "t1"}}}
+
+    check(
+        fc.notify(push_cfg, "Title", "Body", opener=fake_open)
+        and "user=u1" in sent["data"] and "token=t1" in sent["data"],
+        "Pushover request carries credentials",
+    )
+
+    for name in ("FLATENGINE_PUSHOVER_USER", "FLATENGINE_PUSHOVER_TOKEN"):
+        os.environ.pop(name, None)
+
+    check(
+        not fc.notify({}, "Title", "Body", opener=fake_open),
+        "missing Pushover credentials degrade to printing",
+    )
+
+    def failing_open(request, timeout=10):
+        raise OSError("network down")
+
+    check(
+        not fc.notify(push_cfg, "Title", "Body", opener=failing_open),
+        "Pushover failure does not raise",
+    )
+
     rng = np.random.default_rng(1)
     clean = rng.normal(44, 1.5, (600, 900))
 
@@ -384,6 +455,7 @@ def main():
             ROOT / "flat_common.py",
             ROOT / "flat-calibrate.py",
             ROOT / "flat-setup.py",
+            ROOT / "flat-darkflats.py",
         ])
 
         print("PASS: Python syntax")

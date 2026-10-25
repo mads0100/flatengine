@@ -44,6 +44,11 @@ DEFAULTS = {
 
     "darkflat_library": {
         "enabled": True,
+        # "notify": record a missing library, send a Pushover
+        # message and continue without dark-flats; build later
+        # with `flatengine darkflats --build`.
+        # "capture": shoot the missing library immediately.
+        "on_missing": "notify",
         # Empty means <output root>/DarkFlatLibrary.
         "root": "",
         "frames": 30,
@@ -73,6 +78,18 @@ DEFAULTS = {
         "brightness_min": 1,
         "brightness_max": 255,
         "brightness_step": 1,
+    },
+
+    "notify": {
+        # Pushover credentials. FLATENGINE_PUSHOVER_USER and
+        # FLATENGINE_PUSHOVER_TOKEN environment variables also work.
+        "pushover": {
+            "enabled": True,
+            "user_key": "",
+            "app_token": "",
+        },
+        # Re-send a pending dark-flat reminder at most this often.
+        "repeat_hours": 24,
     },
 
     "capabilities": {
