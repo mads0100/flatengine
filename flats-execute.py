@@ -1897,9 +1897,23 @@ def acquire_darkflats(
         probe_file,
         memmap=False,
     ) as hdul:
-        hdr = hdul[0].header
+        hdr = hdul[0].header.copy()
         ccd_temp = hdr.get("CCD-TEMP")
         lownoise = hdr.get("LOWNOISE")
+
+    catalog_key, catalog_record = fc.dark_record_from_header(
+        hdr,
+        config,
+        exposure=exposure,
+        defaults={
+            "INSTRUME": camera,
+            "GAIN": gain,
+            "OFFSET": offset,
+            "XBINNING": xbin,
+            "YBINNING": ybin,
+        },
+    )
+    catalog_record["count"] = count
 
     print()
     print("=" * 72)
@@ -1924,20 +1938,59 @@ def acquire_darkflats(
             ccd_temp=ccd_temp,
         )
 
+        # The catalog is the source of truth: the files may have
+        # been moved to a processing machine.
+        record, problem = fc.catalog_check(
+            catalog_key,
+            count,
+            config,
+            firmware=catalog_record.get("firmware"),
+        )
+
+        if problem is None:
+            print(
+                f"Reusing cataloged dark-flats: {catalog_key}"
+            )
+            print(
+                f"Frames: {record.get('count')}  built "
+                f"{record.get('built')}  at "
+                f"{record.get('location', 'unknown')}"
+            )
+
+            return (
+                [Path(f) for f in record.get("files", [])],
+                library_dir,
+                False,
+            )
+
+        # A complete library still on disk but never cataloged
+        # (built before the catalog existed) is registered once.
         existing = fc.library_files(
             library_dir,
             count,
         )
 
-        if existing:
-            print(
-                f"Reusing dark-flat library: {library_dir}"
+        if existing and problem == "missing":
+            fc.catalog_register(
+                catalog_key,
+                dict(
+                    catalog_record,
+                    count=len(existing),
+                    location=str(library_dir),
+                    files=[str(f) for f in existing],
+                    source="flatengine",
+                ),
             )
+
             print(
-                f"Library frames: {len(existing)}"
+                f"Cataloged existing dark-flat library: {library_dir}"
             )
 
             return existing, library_dir, False
+
+        print(
+            f"Dark-flats needed for {exposure:g} s: {problem}."
+        )
 
         on_missing = str(
             lib_cfg.get(
@@ -1947,29 +2000,14 @@ def acquire_darkflats(
         ).lower()
 
         if on_missing == "notify":
-            step = float(
-                lib_cfg.get(
-                    "temperature_step_c",
-                    5,
-                )
+            details = dict(
+                catalog_record,
+                count=count,
+                profile=profile,
+                kind="dark-flat",
+                reason=problem,
+                catalog_key=catalog_key,
             )
-
-            details = {
-                "camera": camera,
-                "gain": gain,
-                "offset": offset,
-                "xbin": xbin,
-                "ybin": ybin,
-                "exposure": float(exposure),
-                "lownoise": lownoise,
-                "temperature_band_c": (
-                    None
-                    if ccd_temp is None
-                    else round(float(ccd_temp) / step) * step
-                ),
-                "count": count,
-                "profile": profile,
-            }
 
             record, due = fc.record_pending_darkflats(
                 library_dir,
@@ -1985,7 +2023,6 @@ def acquire_darkflats(
             )
 
             print(
-                "No dark-flat library for this exposure. "
                 "Recorded as pending (not captured):"
             )
             print(
@@ -2004,8 +2041,8 @@ def acquire_darkflats(
                     config,
                     "FlatEngine: dark-flats needed",
                     (
-                        f"No library for {profile} flats "
-                        f"(session {session}).\n"
+                        f"{profile} flats (session {session}): "
+                        f"{problem}.\n"
                         f"Shoot {fc.describe_pending(record)}.\n"
                         "After dark, front end covered: "
                         "flatengine darkflats --build"
@@ -2103,6 +2140,17 @@ def acquire_darkflats(
 
         print(
             f"Library registered: {manifest}"
+        )
+
+        fc.catalog_register(
+            catalog_key,
+            dict(
+                catalog_record,
+                count=len(darkflat_files),
+                location=str(library_dir),
+                files=[str(f) for f in darkflat_files],
+                source="flatengine",
+            ),
         )
 
         fc.clear_pending(library_dir)

@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-Manage the dark-flat library.
+Manage pending dark sets: dark-flats and darks for lights.
+(`flatengine darks` and `flatengine darkflats` are the same command.)
 
-  flatengine darkflats                 list pending libraries
-  flatengine darkflats --add 1 30 --like FILE.fits
-                                       request libraries for these
-                                       exposures, using the camera
-                                       state recorded in FILE.fits
-  flatengine darkflats --build         capture every pending library
-  flatengine darkflats --build --exposure 30
+  flatengine darks                     list pending dark sets
+  flatengine darks --add 1 30 --like FILE.fits
+                                       request sets for these exposures
+                                       in the camera state of FILE.fits
+                                       (a light frame requests darks
+                                       for lights; anything else
+                                       requests dark-flats)
+  flatengine darks --build             capture every pending set
+  flatengine darks --build --exposure 120
                                        capture only that exposure
 
-Dark-flats are captured with the panel off and the cover closed.
-Build libraries after dark with the front end covered: every
-capture is checked for light leaks and is not registered if one
-is found.
+Darks are captured with the panel off and the cover closed. Build
+after dark with the front end covered: every capture is checked for
+light leaks and camera state before it is registered in the
+calibration catalog.
 """
 
 from pathlib import Path
@@ -56,7 +59,7 @@ def list_pending():
 
     print()
     print("=" * 72)
-    print("PENDING DARK-FLAT LIBRARIES")
+    print("PENDING DARK SETS")
     print("=" * 72)
 
     if not pending:
@@ -72,6 +75,7 @@ def list_pending():
         start=1,
     ):
         print(f"{index}. {fc.describe_pending(record)}")
+        print(f"   reason:    {record.get('reason', 'missing')}")
         print(f"   camera:    {record.get('camera')}")
         print(f"   requested: {record.get('first_requested')}"
               f"  sessions: {', '.join(record.get('sessions', [])) or '-'}")
@@ -79,65 +83,58 @@ def list_pending():
 
     print("=" * 72)
     print("Build after dark, front end covered: "
-          "flatengine darkflats --build")
+          "flatengine darks --build")
 
     return pending
 
 
 def add_requests(config, exposures, like):
     with fits.open(like, memmap=False) as hdul:
-        hdr = hdul[0].header
+        hdr = hdul[0].header.copy()
 
-    lib_cfg = config.get("darkflat_library", {})
-    step = float(lib_cfg.get("temperature_step_c", 5))
-    count = int(lib_cfg.get("frames", config["frames"]["flats_per_group"]))
-
-    camera = hdr.get("INSTRUME")
-    gain = hdr.get("GAIN")
-    offset = hdr.get("OFFSET")
-    xbin = hdr.get("XBINNING", 1)
-    ybin = hdr.get("YBINNING", 1)
-    lownoise = hdr.get("LOWNOISE")
-    ccd_temp = hdr.get("CCD-TEMP")
-
-    if camera is None or gain is None or offset is None:
+    if hdr.get("INSTRUME") is None or hdr.get("GAIN") is None \
+            or hdr.get("OFFSET") is None:
         raise RuntimeError(
             f"{like} lacks INSTRUME, GAIN or OFFSET; "
             "use a frame captured by the imaging camera."
         )
 
+    for_lights = fc.is_light_frame(hdr)
+
+    if for_lights:
+        kind = "light dark"
+        root = fc.dark_library_root(config)
+        count = int(config.get("calibration_catalog", {})
+                    .get("light_dark_frames", 30))
+    else:
+        kind = "dark-flat"
+        root = fc.darkflat_library_root(config)
+        lib_cfg = config.get("darkflat_library", {})
+        count = int(lib_cfg.get(
+            "frames", config["frames"]["flats_per_group"]))
+
     for exposure in exposures:
-        library_dir = fc.darkflat_library_dir(
-            config, camera, gain, offset, xbin, ybin, exposure,
-            lownoise=lownoise, ccd_temp=ccd_temp,
+        key, record = fc.dark_record_from_header(
+            hdr, config, exposure=exposure,
         )
 
-        if fc.library_files(library_dir, count):
-            print(f"Already built: {exposure:g} s  {library_dir}")
+        _, problem = fc.catalog_check(
+            key, count, config, firmware=record.get("firmware"),
+        )
+
+        if problem is None:
+            print(f"Already cataloged: {exposure:g} s  {key}")
             continue
 
-        record, _ = fc.record_pending_darkflats(
-            library_dir,
-            {
-                "camera": camera,
-                "gain": gain,
-                "offset": offset,
-                "xbin": xbin,
-                "ybin": ybin,
-                "exposure": float(exposure),
-                "lownoise": lownoise,
-                "temperature_band_c": (
-                    None if ccd_temp is None
-                    else round(float(ccd_temp) / step) * step
-                ),
-                "count": count,
-                "profile": "manual request",
-            },
+        pending, _ = fc.record_pending_darkflats(
+            root / key,
+            dict(record, count=count, kind=kind, reason=problem,
+                 catalog_key=key, profile="manual request"),
             session="manual",
             repeat_hours=1e9,
         )
 
-        print(f"Requested: {fc.describe_pending(record)}")
+        print(f"Requested: {fc.describe_pending(pending)}")
 
 
 def verify_camera_state(record, path, step):
@@ -204,7 +201,7 @@ def build(config, exposure_filter, assume_yes):
     )
 
     print()
-    print("DARK-FLAT LIBRARIES TO BUILD")
+    print("DARK SETS TO BUILD")
 
     for record in records:
         print(f"  {fc.describe_pending(record)}")
@@ -299,6 +296,23 @@ def build(config, exposure_filter, assume_yes):
             )
 
         fc.write_library_manifest(library_dir, files, exposure, leak)
+
+        with fits.open(files[0], memmap=False) as hdul:
+            key, cat_record = fc.dark_record_from_header(
+                hdul[0].header, config, exposure=exposure,
+            )
+
+        fc.catalog_register(
+            record.get("catalog_key") or key,
+            dict(
+                cat_record,
+                count=len(files),
+                location=str(library_dir),
+                files=[str(f) for f in files],
+                source="flatengine",
+            ),
+        )
+
         fc.clear_pending(library_dir)
         built.append(record)
 
@@ -306,14 +320,14 @@ def build(config, exposure_filter, assume_yes):
 
     fc.notify(
         config,
-        "FlatEngine: dark-flat libraries built",
+        "FlatEngine: dark sets built",
         "\n".join(fc.describe_pending(r) for r in built),
     )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="List, request and build dark-flat libraries.",
+        description="List, request and build dark sets (darks and dark-flats).",
     )
 
     parser.add_argument("--build", action="store_true",
@@ -356,7 +370,7 @@ if __name__ == "__main__":
     except RuntimeError as exc:
         print()
         print("=" * 72)
-        print("DARK-FLAT LIBRARY ABORTED")
+        print("DARK BUILD ABORTED")
         print("=" * 72)
         print(str(exc).strip())
         print("=" * 72)

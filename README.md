@@ -268,24 +268,63 @@ flats, records the request, and sends a Pushover message such as:
 
     FlatEngine: dark-flats needed
     Shoot 30 x 30 s  G100 O40 B1x1  LowNoise ON  ~-10 C.
-    After dark, front end covered: flatengine darkflats --build
+    After dark, front end covered: flatengine darks --build
 
 The group's manifest records `darkflats_pending: true`. Set
 `on_missing: "capture"` to shoot missing libraries immediately.
 
 Manage the library with:
 
-    flatengine darkflats                        # list pending
-    flatengine darkflats --build                # capture all pending
-    flatengine darkflats --build --exposure 30  # just one
-    flatengine darkflats --add 1 2 30 --like some_flat.fits
+    flatengine darks                        # list pending
+    flatengine darks --build                # capture all pending
+    flatengine darks --build --exposure 30  # just one
+    flatengine darks --add 1 2 30 --like some_flat.fits
                                                 # pre-request libraries
-    flatengine darkflats --test-notify          # check Pushover
+    flatengine darks --test-notify          # check Pushover
 
 `--build` asks for confirmation that it is dark and the front end
 is covered, verifies the captured frames match the requested camera
 state (gain, offset, LOWNOISE, temperature band), runs the leak
 check, and registers the library only if everything passes.
+
+## Calibration Catalog
+
+A capture computer usually hands its calibration files to a
+processing machine, so FlatEngine does not rely on finding dark
+files on disk. It keeps a catalog of which dark sets exist:
+
+    ~/.config/flatengine/calibration-catalog.json
+
+Each entry records camera, gain, offset, binning, LOWNOISE,
+temperature band, exposure, frame count, build date, firmware and
+where the files went. Darks for lights and dark-flats share the
+catalog, because a dark-flat is simply a dark at the flat exposure.
+
+- Sets built by `flatengine darks --build` are cataloged
+  automatically.
+- Darks shot another way (Ekos, another computer): run
+  `flatengine catalog scan DIR` before moving them. It reads the
+  FITS headers, counts frames (a stacked master counts as its
+  NCOMBINE), and registers each set.
+- Or register one by hand:
+  `flatengine catalog add --like frame.fits --exposure 120 --count 50`.
+
+Every nightly run checks each light group's dark needs (exposure,
+gain, offset, binning, low noise, temperature band) and each flat
+exposure against the catalog. A set that is missing, has too few
+frames, is older than `calibration_catalog.max_age_days` (default
+365), or was shot on different camera firmware is recorded as
+pending and announced by Pushover, e.g.:
+
+    FlatEngine: darks needed for lights
+    [light dark] 30 x 120 s  G100 O40 B1x1  LowNoise ON  ~-10 C (missing)
+
+Useful commands:
+
+    flatengine catalog                 # list sets and their status
+    flatengine catalog check           # latest session's lights vs catalog
+    flatengine darks                   # pending sets
+    flatengine darks --build           # shoot pending sets (after dark)
 
 ### Pushover
 

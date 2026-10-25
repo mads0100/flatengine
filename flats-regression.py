@@ -439,6 +439,100 @@ def fixed_exposure_checks():
         finally:
             fc.PENDING_FILE = saved
 
+    # Calibration catalog: source of truth when files have moved.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        saved_catalog = fc.CATALOG_FILE
+        fc.CATALOG_FILE = tmp / "catalog.json"
+
+        try:
+            cat_cfg = {
+                "output": {"root": str(tmp / "cal")},
+                "calibration_catalog": {"max_age_days": 365},
+            }
+
+            hdr = fits.Header()
+            hdr["INSTRUME"] = "ToupTek SkyEye45AC-plus"
+            hdr["GAIN"] = 100
+            hdr["OFFSET"] = 40
+            hdr["XBINNING"] = 1
+            hdr["YBINNING"] = 1
+            hdr["EXPTIME"] = 120.0
+            hdr["LOWNOISE"] = "ON"
+            hdr["CCD-TEMP"] = -10.3
+            hdr["FIRMVER"] = "4.1.2"
+
+            key, rec = fc.dark_record_from_header(hdr, cat_cfg)
+
+            check(
+                fc.catalog_check(key, 30, cat_cfg)[1] == "missing",
+                "uncataloged set is reported missing",
+            )
+
+            fc.catalog_register(
+                key, dict(rec, count=50, location="moved to PC"),
+            )
+
+            check(
+                fc.catalog_check(key, 30, cat_cfg, firmware="4.1.2")[1] is None,
+                "cataloged set is usable with no files on disk",
+            )
+
+            check(
+                "frames" in fc.catalog_check(key, 60, cat_cfg)[1],
+                "too few cataloged frames is reported",
+            )
+
+            check(
+                "firmware" in fc.catalog_check(
+                    key, 30, cat_cfg, firmware="4.2.0")[1],
+                "firmware change marks the set stale",
+            )
+
+            fc.catalog_register(key, dict(rec, count=50, built="2020-01-01"))
+
+            check(
+                "older than" in fc.catalog_check(key, 30, cat_cfg)[1],
+                "old set is reported stale",
+            )
+
+            # Lights in a synthetic session drive the requirements.
+            lights = tmp / "Pictures" / "M33"
+            lights.mkdir(parents=True)
+
+            for index in range(3):
+                light = hdr.copy()
+                light["IMAGETYP"] = "Light Frame"
+                light["SESSION"] = "20991231"
+                fits.PrimaryHDU(
+                    np.zeros((4, 4), dtype=np.uint16), light,
+                ).writeto(lights / f"light_{index}.fits")
+
+            fc.catalog_register(key, dict(rec, count=50))
+
+            results = fc.light_dark_requirements(
+                tmp / "Pictures", "20991231", cat_cfg,
+            )
+
+            check(
+                len(results) == 1 and results[0][2] is None
+                and results[0][3] == 3,
+                "lights find their cataloged darks",
+            )
+
+            fc.catalog_remove(key)
+
+            results = fc.light_dark_requirements(
+                tmp / "Pictures", "20991231", cat_cfg,
+            )
+
+            check(
+                results[0][2] == "missing",
+                "lights without darks are flagged",
+            )
+        finally:
+            fc.CATALOG_FILE = saved_catalog
+
     sent = {}
 
     class FakeResponse(io.BytesIO):
@@ -517,6 +611,7 @@ def main():
             ROOT / "flat-calibrate.py",
             ROOT / "flat-setup.py",
             ROOT / "flat-darkflats.py",
+            ROOT / "flat-catalog.py",
         ])
 
         print("PASS: Python syntax")

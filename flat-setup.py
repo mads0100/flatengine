@@ -84,6 +84,18 @@ DEFAULTS = {
         "brightness_step": 1,
     },
 
+    "calibration_catalog": {
+        # The catalog (~/.config/flatengine/calibration-catalog.json)
+        # records which dark sets exist, so files can be moved to a
+        # processing machine without FlatEngine re-requesting them.
+        "check_light_darks": True,
+        "light_dark_frames": 30,
+        # Ask for a rebuild after this many days; 0 disables.
+        "max_age_days": 365,
+        # Empty means <output root>/DarkLibrary.
+        "darks_root": "",
+    },
+
     "notify": {
         # Pushover credentials. FLATENGINE_PUSHOVER_USER and
         # FLATENGINE_PUSHOVER_TOKEN environment variables also work.

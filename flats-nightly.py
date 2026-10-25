@@ -485,6 +485,12 @@ def main():
     print()
     print("=" * 72)
 
+    check_light_darks(
+        session,
+        config,
+        record=not args.dry_run,
+    )
+
     if args.dry_run:
         print(
             "DRY RUN ONLY. "
@@ -615,6 +621,83 @@ def main():
     print_pending_darkflats()
 
 
+def check_light_darks(session, config, record=True):
+    """
+    Check every light group's dark needs (exposure, gain, offset,
+    binning, low noise, temperature band, firmware) against the
+    calibration catalog. Missing or stale sets are recorded as
+    pending and announced in one Pushover message.
+    """
+    settings = config.get("calibration_catalog", {})
+
+    if not settings.get("check_light_darks", True):
+        return []
+
+    results = fc.light_dark_requirements(
+        PICTURES,
+        session,
+        config,
+    )
+
+    if not results:
+        return results
+
+    print("DARKS FOR LIGHTS")
+
+    due_records = []
+
+    for key, req, problem, lights in results:
+        status = "cataloged" if problem is None else f"NEEDED: {problem}"
+
+        print(
+            f"  {lights:>4} lights  "
+            f"{float(req['exposure']):g} s  "
+            f"G{req.get('gain')} O{req.get('offset')} "
+            f"LN {req.get('lownoise') or 'n/a'} "
+            f"~{req.get('temperature_band_c')} C  [{status}]"
+        )
+
+        if problem is None or not record:
+            continue
+
+        pending, due = fc.record_pending_darkflats(
+            fc.dark_library_root(config) / key,
+            dict(
+                req,
+                kind="light dark",
+                reason=problem,
+                catalog_key=key,
+                profile="lights",
+            ),
+            session,
+            repeat_hours=config.get("notify", {}).get(
+                "repeat_hours", 24,
+            ),
+        )
+
+        if due:
+            due_records.append(pending)
+
+    print()
+
+    if due_records:
+        fc.notify(
+            config,
+            "FlatEngine: darks needed for lights",
+            (
+                f"Session {session}:\n"
+                + "\n".join(
+                    f"{fc.describe_pending(r)} ({r.get('reason')})"
+                    for r in due_records
+                )
+                + "\nShot elsewhere? flatengine catalog scan DIR. "
+                "Else after dark: flatengine darks --build"
+            ),
+        )
+
+    return results
+
+
 def print_pending_darkflats():
     pending = fc.load_pending()
 
@@ -622,7 +705,7 @@ def print_pending_darkflats():
         return
 
     print()
-    print("DARK-FLAT LIBRARIES STILL NEEDED")
+    print("DARK SETS STILL NEEDED")
 
     for record in sorted(
         pending.values(),
@@ -632,7 +715,7 @@ def print_pending_darkflats():
 
     print(
         "Build after dark, front end covered: "
-        "flatengine darkflats --build"
+        "flatengine darks --build"
     )
 
 

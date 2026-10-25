@@ -939,7 +939,26 @@ def darkflat_library_root(config):
     )
 
 
-def darkflat_library_dir(
+def temperature_step(config):
+    return float(
+        config.get(
+            "darkflat_library",
+            {},
+        ).get(
+            "temperature_step_c",
+            5,
+        )
+    )
+
+
+def temperature_band(ccd_temp, step):
+    if ccd_temp is None:
+        return None
+
+    return round(float(ccd_temp) / step) * step
+
+
+def dark_key(
     config,
     camera,
     gain,
@@ -950,17 +969,11 @@ def darkflat_library_dir(
     lownoise=None,
     ccd_temp=None,
 ):
-    lib = config.get(
-        "darkflat_library",
-        {},
-    )
-
-    step = float(
-        lib.get(
-            "temperature_step_c",
-            5,
-        )
-    )
+    """
+    Canonical identity of a dark set. Darks for lights and
+    dark-flats share it: a dark-flat is a dark at the flat exposure.
+    """
+    step = temperature_step(config)
 
     if ccd_temp is None:
         temp_text = "NA"
@@ -984,7 +997,31 @@ def darkflat_library_dir(
         f"_E{_fmt(exposure)}s"
     )
 
-    return darkflat_library_root(config) / name
+    return name
+
+
+def darkflat_library_dir(
+    config,
+    camera,
+    gain,
+    offset,
+    xbin,
+    ybin,
+    exposure,
+    lownoise=None,
+    ccd_temp=None,
+):
+    return darkflat_library_root(config) / dark_key(
+        config,
+        camera,
+        gain,
+        offset,
+        xbin,
+        ybin,
+        exposure,
+        lownoise=lownoise,
+        ccd_temp=ccd_temp,
+    )
 
 
 def library_files(library_dir, count):
@@ -1213,7 +1250,10 @@ def clear_pending(library_dir):
 
 
 def describe_pending(record):
+    kind = record.get("kind", "dark-flat")
+
     return (
+        f"[{kind}] "
         f"{record.get('count', 30)} x {float(record['exposure']):g} s  "
         f"G{record.get('gain')} O{record.get('offset')} "
         f"B{record.get('xbin')}x{record.get('ybin')}  "
@@ -1319,3 +1359,254 @@ def notify(
     except (urllib.error.URLError, OSError, ValueError) as exc:
         print(f"Pushover failed ({exc}); continuing.")
         return False
+
+
+# ---------------------------------------------------------------------
+# Calibration catalog
+#
+# A capture computer usually hands its calibration files to a
+# processing machine, so FlatEngine cannot rely on finding them on
+# disk. The catalog records which dark sets exist (camera state,
+# exposure, frame count, date, firmware); it is the source of truth.
+# Darks for lights and dark-flats share one catalog.
+# ---------------------------------------------------------------------
+
+CATALOG_FILE = CONFIG_DIR / "calibration-catalog.json"
+
+
+def load_catalog():
+    if not CATALOG_FILE.exists():
+        return {"darks": {}}
+
+    try:
+        catalog = json.loads(CATALOG_FILE.read_text())
+    except (OSError, ValueError):
+        return {"darks": {}}
+
+    catalog.setdefault("darks", {})
+
+    return catalog
+
+
+def save_catalog(catalog):
+    CATALOG_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    CATALOG_FILE.write_text(
+        json.dumps(
+            catalog,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def catalog_register(key, record):
+    catalog = load_catalog()
+
+    entry = dict(record)
+    entry.setdefault(
+        "built",
+        time.strftime("%Y-%m-%d"),
+    )
+    entry["registered"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    catalog["darks"][key] = entry
+    save_catalog(catalog)
+
+    return entry
+
+
+def catalog_remove(key):
+    catalog = load_catalog()
+
+    if catalog["darks"].pop(key, None) is None:
+        return False
+
+    save_catalog(catalog)
+    return True
+
+
+def catalog_check(
+    key,
+    count,
+    config,
+    firmware=None,
+):
+    """
+    Return (record, problem). problem is None when the catalog has
+    a usable set; otherwise a short reason to rebuild it.
+    """
+    record = load_catalog()["darks"].get(key)
+
+    if record is None:
+        return None, "missing"
+
+    if int(record.get("count", 0)) < int(count):
+        return record, (
+            f"only {record.get('count')} frames "
+            f"(need {count})"
+        )
+
+    max_age = float(
+        config.get(
+            "calibration_catalog",
+            {},
+        ).get(
+            "max_age_days",
+            365,
+        )
+    )
+
+    built = record.get("built")
+
+    if built and max_age > 0:
+        try:
+            built_epoch = time.mktime(
+                time.strptime(str(built)[:10], "%Y-%m-%d")
+            )
+            age_days = (time.time() - built_epoch) / 86400.0
+
+            if age_days > max_age:
+                return record, (
+                    f"built {built}, older than "
+                    f"{max_age:g} days"
+                )
+        except ValueError:
+            pass
+
+    if (
+        firmware
+        and record.get("firmware")
+        and str(record["firmware"]) != str(firmware)
+    ):
+        return record, (
+            f"shot on firmware {record['firmware']}; "
+            f"camera now reports {firmware}"
+        )
+
+    return record, None
+
+
+def dark_record_from_header(
+    hdr,
+    config,
+    exposure=None,
+    defaults=None,
+):
+    """
+    Camera-state fields for a catalog or pending record. `defaults`
+    fills keywords a driver does not write (e.g. the light group's
+    camera, gain and offset).
+    """
+    step = temperature_step(config)
+
+    if defaults:
+        hdr = hdr.copy()
+
+        for name, value in defaults.items():
+            if hdr.get(name) is None and value is not None:
+                hdr[name] = value
+
+    exposure = float(
+        exposure
+        if exposure is not None
+        else hdr.get("EXPTIME")
+    )
+
+    record = {
+        "camera": hdr.get("INSTRUME"),
+        "gain": hdr.get("GAIN"),
+        "offset": hdr.get("OFFSET"),
+        "xbin": hdr.get("XBINNING", 1),
+        "ybin": hdr.get("YBINNING", 1),
+        "exposure": exposure,
+        "lownoise": hdr.get("LOWNOISE"),
+        "temperature_band_c": temperature_band(
+            hdr.get("CCD-TEMP"),
+            step,
+        ),
+        "firmware": hdr.get("FIRMVER"),
+        "serial": hdr.get("SN"),
+    }
+
+    key = dark_key(
+        config,
+        record["camera"],
+        record["gain"],
+        record["offset"],
+        record["xbin"],
+        record["ybin"],
+        exposure,
+        lownoise=record["lownoise"],
+        ccd_temp=hdr.get("CCD-TEMP"),
+    )
+
+    return key, record
+
+
+def dark_library_root(config):
+    """Where `flatengine darks --build` writes darks for lights."""
+    root = config.get(
+        "calibration_catalog",
+        {},
+    ).get("darks_root")
+
+    if root:
+        return Path(root).expanduser()
+
+    return (
+        Path(config["output"]["root"]).expanduser()
+        / "DarkLibrary"
+    )
+
+
+def light_dark_requirements(
+    pictures,
+    session,
+    config,
+):
+    """
+    Group a session's light frames by the dark set they need and
+    check each against the catalog.
+
+    Returns a list of (key, record, problem, light_count).
+    """
+    settings = config.get(
+        "calibration_catalog",
+        {},
+    )
+
+    count = int(settings.get("light_dark_frames", 30))
+
+    groups = {}
+
+    for _, hdr, _ in find_light_frames(
+        pictures,
+        session=session,
+    ):
+        if hdr.get("EXPTIME") is None:
+            continue
+
+        key, record = dark_record_from_header(hdr, config)
+        record["count"] = count
+
+        entry = groups.setdefault(key, [record, 0])
+        entry[1] += 1
+
+    results = []
+
+    for key, (record, lights) in sorted(groups.items()):
+        _, problem = catalog_check(
+            key,
+            count,
+            config,
+            firmware=record.get("firmware"),
+        )
+
+        results.append((key, record, problem, lights))
+
+    return results
