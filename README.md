@@ -205,6 +205,19 @@ some drivers write incorrectly. A saturation cap
 warning is printed when the weakest channel falls under
 `weakest_channel_min_adu` (default 1000).
 
+When the panel is already at full brightness and the brightest
+channel is below target but at least `min_brightest_fraction` of
+full scale (default 0.25, about 4,100 ADU at 14-bit), FlatEngine
+accepts that level and keeps the shorter exposure instead of
+stepping up the ladder, so most filters stay at 1 s with one
+dark-flat library. The weakest channel must still clear
+`weakest_channel_min_adu` (default 1000) above the pedestal; through
+a dual-band filter, whose red or blue is very weak, that keeps the
+full target and the normal ladder. Each run prints a flat level analysis, including
+how large a 2 ADU calibration error would be relative to the
+weakest channel, and warns above 0.2%. Set the fraction to 0 to
+always reach the full target.
+
 The flat count adapts to the weakest Bayer channel. Master-flat
 signal-to-noise grows with the square root of the electrons
 collected, so FlatEngine shoots

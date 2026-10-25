@@ -25,6 +25,10 @@ DEFAULTS = {
         "tolerance_fraction": 0.05,
         # Nightly tuning targets the brightest Bayer channel.
         "brightest_channel_fraction": 0.64,
+        # At full panel brightness, accept the brightest channel down
+        # to this fraction before lengthening the exposure; the
+        # adaptive frame count makes up the signal. 0 disables.
+        "min_brightest_fraction": 0.25,
         "saturation_cap_fraction": 0.80,
         "weakest_channel_min_adu": 1000,
         "max_tuning_attempts": 8,

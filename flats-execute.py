@@ -1608,6 +1608,11 @@ def tune_flat_settings(
         bits,
     )
 
+    accept_floor = fc.flat_floor(
+        config,
+        bits,
+    )
+
     b_min, b_max, b_step = panel_limits(config)
 
     max_attempts = int(
@@ -1646,6 +1651,15 @@ def tune_flat_settings(
     print(
         f"Cap:        {cap} ADU   "
         f"Weak-channel floor: {floor} ADU"
+    )
+    print(
+        "Accept:     "
+        + (
+            f"down to {accept_floor} ADU at full brightness "
+            "before lengthening the exposure"
+            if accept_floor is not None
+            else "target only (min_brightest_fraction = 0)"
+        )
     )
     print(
         "Ladder:     "
@@ -1710,15 +1724,64 @@ def tune_flat_settings(
             b_max=b_max,
             b_step=b_step,
             blocked=blocked,
+            floor=accept_floor,
+            weak_floor=floor + float(
+                config.get("frames", {}).get("pedestal_adu", 0)
+            ),
         )
 
         if done:
+            pedestal = float(
+                config.get("frames", {}).get("pedestal_adu", 0)
+            )
+
+            error_pct = fc.additive_error_percent(
+                levels,
+                error_adu=2.0,
+                pedestal=pedestal,
+            )
+
+            levels = dict(levels)
+            levels["accepted_below_target"] = (
+                levels["brightest"] < target * (1 - tolerance)
+            )
+            levels["additive_error_2adu_percent"] = round(
+                error_pct,
+                3,
+            )
+
+            print()
+            print("FLAT LEVEL ANALYSIS")
+            print(
+                f"  Brightest channel: {levels['brightest']:.0f} ADU "
+                f"({100 * levels['brightest'] / ((2 ** bits) - 1):.0f}% "
+                f"of full scale; target {target})"
+            )
+            print(
+                f"  Weakest channel:   {levels['weakest']:.0f} ADU"
+            )
+            print(
+                f"  A 2 ADU calibration error = {error_pct:.3f}% "
+                "of the weakest channel"
+            )
+
+            if levels["accepted_below_target"]:
+                print(
+                    f"  Accepted below target at full brightness to "
+                    f"hold {exposure:g} s; the frame count compensates."
+                )
+
             if levels["weakest"] < floor:
                 print(
-                    f"NOTE: weakest CFA channel "
-                    f"{levels['weakest']:.0f} ADU is under "
-                    f"{floor} ADU; the flat count is raised "
-                    "to compensate."
+                    f"  NOTE: weakest channel under {floor} ADU; "
+                    "the flat count is raised to compensate."
+                )
+
+            if error_pct > 0.2:
+                print(
+                    "  WARNING: this flat is sensitive to small "
+                    "calibration errors (over 0.2% per 2 ADU). Match "
+                    "dark-flats exactly and avoid light leaks."
                 )
 
             return brightness, exposure, levels, probe_file

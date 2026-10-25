@@ -438,6 +438,45 @@ def flat_targets(config, bits=14):
     return target, tolerance, cap, floor
 
 
+def flat_floor(config, bits=14):
+    """
+    Lowest brightest-channel level accepted at a given exposure
+    when the panel is already at full brightness, before stepping
+    to a longer exposure. The adaptive frame count makes up the
+    signal. Returns ADU, or None when disabled (fraction 0).
+
+    Default 0.25 of full scale (about 4,100 ADU at 14-bit): low
+    enough to keep most filters at 1 s, high enough that a 2 ADU
+    calibration error stays near 0.05% of the flat.
+    """
+    fraction = float(
+        config.get(
+            "flat_target",
+            {},
+        ).get(
+            "min_brightest_fraction",
+            0.25,
+        )
+    )
+
+    if fraction <= 0:
+        return None
+
+    return round(((2 ** int(bits)) - 1) * fraction)
+
+
+def additive_error_percent(levels, error_adu=2.0, pedestal=0.0):
+    """
+    How large a small additive calibration error (pedestal drift,
+    dark-flat mismatch, faint leak) is relative to the weakest
+    channel of the flat, in percent. Flats correct by division, so
+    this becomes a multiplicative error in every corrected light.
+    """
+    signal = max(1.0, levels["weakest"] - pedestal)
+
+    return 100.0 * float(error_adu) / signal
+
+
 def cfa_levels(data, ceiling=None):
     """
     Median of each 2x2 Bayer position over the central 80% of the
@@ -548,6 +587,7 @@ def plan_next_probe(
     b_step=1,
     gamma=0.85,
     blocked=(),
+    floor=None,
 ):
     """
     Choose the next (brightness, exposure) after a probe measured
@@ -601,6 +641,15 @@ def plan_next_probe(
         ]
 
         if brightness < b_max and required <= exposure:
+            return int(b_max), exposure
+
+        # Full brightness here would clear the floor: try it before
+        # paying for a longer exposure and another dark-flat library.
+        if (
+            floor is not None
+            and brightness < b_max
+            and at_max >= floor
+        ):
             return int(b_max), exposure
 
         if candidates:
@@ -664,22 +713,58 @@ def tuning_step(
     b_max,
     b_step=1,
     blocked=None,
+    floor=None,
+    gamma=0.85,
+    weak_floor=None,
 ):
     """
     One decision of the panel-tuning loop.
 
-    Returns (done, brightness, exposure). `done` is True only when
-    the probe is in tolerance AND no shorter ladder step could be
-    served by the panel, so flats always use the shortest workable
-    exposure. `blocked` (a set) accumulates exposures proven too dim
-    at maximum brightness.
+    Returns (done, brightness, exposure). A probe is acceptable when
+    it is in tolerance, or when the panel is at full brightness and
+    the brightest channel is at least `floor` (the frame count then
+    makes up the signal). `done` is True only when the probe is
+    acceptable AND no shorter ladder step could also be acceptable,
+    so flats always use the shortest workable exposure. `blocked`
+    (a set) accumulates exposures proven unusable at maximum
+    brightness.
     """
     if blocked is None:
         blocked = set()
 
     measured = levels["brightest"]
 
-    if in_flat_tolerance(levels, target, tolerance, cap):
+    # Brightest and weakest channels scale together, so a weakest-
+    # channel minimum is equivalent to a higher brightest-channel
+    # floor. Through a dual-band filter (very weak red) this pushes
+    # the floor up to the target, and the normal ladder applies.
+    weakest = levels.get("weakest")
+
+    if (
+        floor is not None
+        and weak_floor is not None
+        and weakest
+    ):
+        floor = max(
+            floor,
+            weak_floor * measured / max(weakest, 1.0),
+        )
+
+    in_tolerance = in_flat_tolerance(
+        levels,
+        target,
+        tolerance,
+        cap,
+    )
+
+    below_target_ok = (
+        floor is not None
+        and brightness >= b_max
+        and floor <= measured < target * (1 - tolerance)
+        and measured <= cap
+    )
+
+    if in_tolerance or below_target_ok:
         index = ladder.index(exposure)
 
         if index > 0 and ladder[index - 1] not in blocked:
@@ -698,11 +783,29 @@ def tuning_step(
                     shorter,
                 )
 
+            # Full brightness at the shorter step may still clear
+            # the floor even if it cannot reach the target.
+            at_max_shorter = (
+                measured
+                * (b_max / max(brightness, 1)) ** (1.0 / gamma)
+                * shorter
+                / exposure
+            )
+
+            if floor is not None and at_max_shorter >= floor:
+                return False, int(b_max), shorter
+
         return True, brightness, exposure
+
+    unusable_below = (
+        floor
+        if floor is not None
+        else target * (1 - tolerance)
+    )
 
     if (
         brightness >= b_max
-        and measured < target * (1 - tolerance)
+        and measured < unusable_below
     ):
         blocked.add(exposure)
 
@@ -715,7 +818,9 @@ def tuning_step(
         b_min=b_min,
         b_max=b_max,
         b_step=b_step,
+        gamma=gamma,
         blocked=blocked,
+        floor=floor,
     )
 
     return False, new_brightness, new_exposure

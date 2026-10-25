@@ -274,6 +274,67 @@ def fixed_exposure_checks():
     b, e = simulate(1.2, 1.15, 200, 60.0)
     check(e == 20.0, f"narrowband steps down to 20 s (brightness {b})")
 
+    # With the floor: a filter that reaches only ~6,000 ADU at full
+    # brightness in 1 s is accepted at 1 s instead of stepping to 2 s.
+    floor = fc.flat_floor({"flat_target": {}}, 14)
+
+    def simulate_floor(adu_per_unit_second, start_b, start_e):
+        b, e = start_b, start_e
+        blocked = set()
+        measured = None
+
+        for _ in range(12):
+            measured = min(16383, adu_per_unit_second * b * e)
+
+            done, b, e = fc.tuning_step(
+                b, e, {"brightest": measured}, target, tol, cap,
+                ladder, 1, 255, 1, blocked=blocked, floor=floor,
+            )
+
+            if done:
+                return b, e, measured
+
+        raise RuntimeError("did not converge")
+
+    b, e, m = simulate_floor(6000 / 255, 128, 1.0)
+    check(
+        e == 1.0 and b == 255 and floor <= m < target,
+        f"floor holds 1 s at {m:.0f} ADU instead of stepping up",
+    )
+
+    b, e, m = simulate_floor(6000 / 255, 128, 5.0)
+    check(e == 1.0, "floor steps back down to 1 s from a long exposure")
+
+    b, e, m = simulate_floor(3000 / 255, 128, 1.0)
+    check(
+        e == 2.0 and m >= floor,
+        f"below the floor at 1 s still steps up ({e:g} s, {m:.0f} ADU)",
+    )
+
+    # Dual-band: brightest clears the floor but red is tiny, so the
+    # weak-channel minimum blocks below-target acceptance.
+    done, b, e = fc.tuning_step(
+        255, 10.0, {"brightest": 4482, "weakest": 465}, target, tol,
+        cap, ladder, 1, 255, 1, blocked=set(), floor=floor,
+        weak_floor=1044,
+    )
+    check(
+        not done and e > 10.0,
+        f"weak dual-band channel overrides the floor (next {e:g} s)",
+    )
+
+    done, b, e = fc.tuning_step(
+        255, 1.0, {"brightest": 6000, "weakest": 2300}, target, tol,
+        cap, ladder, 1, 255, 1, blocked=set(), floor=floor,
+        weak_floor=1044,
+    )
+    check(done and e == 1.0, "broadband below target is still accepted at 1 s")
+
+    check(
+        abs(fc.additive_error_percent({"weakest": 1044}, 2.0, 44) - 0.2) < 1e-9,
+        "additive-error sensitivity at 1,000 ADU above pedestal is 0.2%",
+    )
+
     # Library naming is stable for small temperature jitter.
     a = fc.darkflat_library_dir(
         config, "ToupTek SkyEye45AC-plus", 100, 40, 1, 1, 1.0,
