@@ -5,6 +5,11 @@ import json
 from datetime import datetime, timedelta
 from astropy.io import fits
 
+try:
+    import flat_common as fc
+except ImportError:  # running outside the installed scripts dir
+    fc = None
+
 
 SESSION_KEY = "SESSION"
 
@@ -51,10 +56,28 @@ def main():
             "Observing-night session identifier"
         )
 
+        stamped = []
+
+        # Custom keywords from flat-config.json "stamp_keywords".
+        # Failures are reported but never stop the capture.
+        if fc is not None and fc.CONFIG_FILE.exists():
+            try:
+                config = json.loads(fc.CONFIG_FILE.read_text())
+                values, problems = fc.resolve_stamp_keywords(config)
+                fc.stamp_header(hdr, values)
+                stamped = [f"{k}={v[0]}" for k, v in values.items()]
+
+                for problem in problems:
+                    print(f"stamp skipped: {problem}", file=sys.stderr)
+            except Exception as exc:
+                print(f"custom stamping failed: {exc}", file=sys.stderr)
+
         hdul.flush()
 
     print(
-        f"SESSION={session} stamped into {filename}"
+        f"SESSION={session} "
+        + " ".join(stamped)
+        + f" stamped into {filename}"
     )
 
     return 0

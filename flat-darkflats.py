@@ -224,6 +224,7 @@ def build(config, exposure_filter, assume_yes):
 
     ex = load_executor()
     ex.configure_runtime(config)
+    ex.resolve_stamps(config)
 
     lib_cfg = config.get("darkflat_library", {})
     step = float(lib_cfg.get("temperature_step_c", 5))

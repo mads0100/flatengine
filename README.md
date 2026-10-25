@@ -547,6 +547,41 @@ Regression tests do not move hardware.
     flatengine doctor
     flatengine stamp --help
 
+## Custom FITS Keywords
+
+INDI drivers decide which camera state reaches the FITS header, and
+many controls (conversion gain, readout modes) never do. FlatEngine
+lets you build your own: `stamp_keywords` in `flat-config.json` maps
+FITS keywords to a source, and every frame gets them.
+
+    "stamp_keywords": {
+      "CONVGAIN": {
+        "indi_switch": "ToupTek SkyEye45AC-plus.TC_CONVERSION_GAIN",
+        "map": {"GAIN_HIGH": "HCG", "GAIN_LOW": "LCG"},
+        "comment": "Conversion gain mode"
+      }
+    }
+
+Sources:
+
+- `"value"`: a constant
+- `"indi"`: one INDI element, `Device.PROPERTY.ELEMENT`
+- `"indi_switch"`: an INDI switch property, `Device.PROPERTY`; the
+  element that is On, optionally renamed through `"map"`
+- `"command"`: first line of a command's output
+
+`session-postcapture.py` stamps them into each frame Ekos captures,
+and FlatEngine stamps the same values into the probes, flats and
+dark sets it captures. A source that cannot be read is skipped with
+a warning; it never blocks capture. To make a stamped keyword part
+of dark matching, add it to `calibration_catalog.extra_match_keywords`:
+
+    "calibration_catalog": {
+      "extra_match_keywords": ["CONVGAIN"]
+    }
+
+Keywords are limited to 8 characters (FITS standard).
+
 ## Ekos Post-Capture Integration
 
 FlatEngine includes:

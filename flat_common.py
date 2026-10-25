@@ -10,6 +10,7 @@ from astropy.io import fits
 import json
 import os
 import re
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -1726,3 +1727,150 @@ def light_dark_requirements(
         results.append((key, record, problem, lights))
 
     return results
+
+
+# ---------------------------------------------------------------------
+# Custom FITS keywords ("build your own header")
+#
+# flat-config.json "stamp_keywords" maps FITS keywords to a source:
+#
+#   "CONVGAIN": {
+#     "indi_switch": "ToupTek SkyEye45AC-plus.TC_CONVERSION_GAIN",
+#     "map": {"GAIN_HIGH": "HCG", "GAIN_LOW": "LCG"},
+#     "comment": "Conversion gain mode"
+#   }
+#   "FOCTEMP":  {"indi": "Focuser.FOCUS_TEMPERATURE.TEMPERATURE"}
+#   "SITE":     {"value": "Woodbury MN"}
+#   "SQM":      {"command": ["read-sqm"], "comment": "mag/arcsec2"}
+#
+# The Ekos post-capture script stamps them into every captured frame,
+# and FlatEngine stamps the same values into the flats, probes and
+# dark sets it captures, so calibration frames carry identical state.
+# ---------------------------------------------------------------------
+
+def _run_indi_getprop(pattern):
+    result = subprocess.run(
+        ["indi_getprop", "-t", "2", pattern],
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    return result.stdout
+
+
+def _parse_indi(text):
+    values = {}
+
+    for line in text.splitlines():
+        if "=" in line:
+            name, value = line.split("=", 1)
+            values[name.strip()] = value.strip()
+
+    return values
+
+
+def resolve_stamp_keywords(config, indi_runner=None, command_runner=None):
+    """
+    Resolve every configured keyword to (value, comment).
+
+    Never raises: a keyword whose source cannot be read is skipped
+    and reported in the returned `problems` list, so a flaky device
+    never blocks capture.
+
+    Returns (values, problems).
+    """
+    specs = config.get("stamp_keywords", {}) or {}
+    indi = indi_runner or _run_indi_getprop
+    values = {}
+    problems = []
+
+    for keyword, spec in specs.items():
+        keyword = str(keyword).upper()[:8]
+        comment = str(spec.get("comment", ""))[:47]
+
+        try:
+            if "value" in spec:
+                value = spec["value"]
+
+            elif "indi_switch" in spec:
+                prop = spec["indi_switch"]
+                state = _parse_indi(indi(f"{prop}.*"))
+                on = [
+                    name.rsplit(".", 1)[-1]
+                    for name, val in state.items()
+                    if val == "On"
+                ]
+
+                if len(on) != 1:
+                    raise RuntimeError(
+                        f"{prop}: expected one switch On, got {on or 'none'}"
+                    )
+
+                value = spec.get("map", {}).get(on[0], on[0])
+
+            elif "indi" in spec:
+                prop = spec["indi"]
+                state = _parse_indi(indi(prop))
+
+                if prop not in state:
+                    raise RuntimeError(f"{prop}: not reported by INDI")
+
+                value = state[prop]
+
+                try:
+                    value = float(value)
+                    if value.is_integer():
+                        value = int(value)
+                except ValueError:
+                    pass
+
+            elif "command" in spec:
+                command = spec["command"]
+
+                if isinstance(command, str):
+                    command = command.split()
+
+                runner = command_runner or (
+                    lambda cmd: subprocess.run(
+                        cmd,
+                        text=True,
+                        capture_output=True,
+                        timeout=10,
+                    ).stdout
+                )
+
+                output = runner(command).strip().splitlines()
+
+                if not output:
+                    raise RuntimeError(f"{command[0]}: no output")
+
+                value = output[0].strip()
+
+            else:
+                raise RuntimeError("no source (value/indi/indi_switch/command)")
+
+        except Exception as exc:  # never block capture
+            problems.append(f"{keyword}: {exc}")
+            continue
+
+        values[keyword] = (value, comment)
+
+    return values, problems
+
+
+def stamp_header(hdr, values):
+    """Write resolved keywords into an astropy header in place."""
+    for keyword, (value, comment) in values.items():
+        hdr[keyword] = (value, comment) if comment else value
+
+    return hdr
+
+
+def stamp_file(path, values):
+    if not values:
+        return
+
+    with fits.open(path, mode="update", memmap=False) as hdul:
+        stamp_header(hdul[0].header, values)
+        hdul.flush()

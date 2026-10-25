@@ -100,6 +100,12 @@ DEFAULTS = {
         "extra_match_keywords": [],
     },
 
+    # Custom FITS keywords stamped into every frame by the Ekos
+    # post-capture script and into FlatEngine's own captures.
+    # Sources: "value", "indi" (Device.PROP.ELEMENT), "indi_switch"
+    # (Device.PROP, with optional "map"), or "command".
+    "stamp_keywords": {},
+
     "notify": {
         # Pushover credentials. FLATENGINE_PUSHOVER_USER and
         # FLATENGINE_PUSHOVER_TOKEN environment variables also work.

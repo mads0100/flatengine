@@ -37,6 +37,27 @@ FLAT_DEVICE = None
 
 KSTARS_DEST = None
 
+# Custom keywords (flat-config.json "stamp_keywords") resolved once
+# per run and stamped into every frame FlatEngine captures.
+STAMP_VALUES = {}
+
+
+def resolve_stamps(config):
+    global STAMP_VALUES
+
+    STAMP_VALUES, problems = fc.resolve_stamp_keywords(config)
+
+    if STAMP_VALUES:
+        print(
+            "Stamping: "
+            + ", ".join(f"{k}={v[0]}" for k, v in STAMP_VALUES.items())
+        )
+
+    for problem in problems:
+        print(f"WARNING: stamp keyword skipped: {problem}")
+
+    return STAMP_VALUES
+
 
 def run(cmd, check=True):
     result = subprocess.run(
@@ -1256,6 +1277,8 @@ def read_probe_result(
             "Observing-night session identifier"
         )
 
+        fc.stamp_header(hdr, STAMP_VALUES)
+
         hdul.flush()
 
     print(
@@ -1429,7 +1452,9 @@ def verify_new_darkflats(
                     "Observing-night session identifier"
                 )
 
-                hdul.flush()
+            fc.stamp_header(hdr, STAMP_VALUES)
+
+            hdul.flush()
 
     if bad:
         raise RuntimeError(
@@ -1510,6 +1535,7 @@ def verify_new_flats(
                 session,
                 "Observing-night session identifier"
             )
+            fc.stamp_header(hdul[0].header, STAMP_VALUES)
             hdul.flush()
 
     if bad:
@@ -2205,6 +2231,8 @@ def main():
     configure_runtime(
         config
     )
+
+    resolve_stamps(config)
 
     profiles = load_json(PROFILES)
 

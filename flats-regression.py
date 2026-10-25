@@ -572,6 +572,47 @@ def fixed_exposure_checks():
         finally:
             fc.CATALOG_FILE = saved_catalog
 
+    # Custom keyword stamping from INDI, using the SkyEye45AC-plus
+    # property names, with INDI faked.
+    def fake_indi(pattern):
+        props = {
+            "ToupTek SkyEye45AC-plus.TC_CONVERSION_GAIN.GAIN_LOW": "Off",
+            "ToupTek SkyEye45AC-plus.TC_CONVERSION_GAIN.GAIN_HIGH": "On",
+            "ToupTek SkyEye45AC-plus.CCD_CONTROLS.Gain": "100",
+        }
+        prefix = pattern.rstrip("*").rstrip(".")
+        return "\n".join(
+            f"{k}={v}" for k, v in props.items() if k.startswith(prefix)
+        )
+
+    stamp_cfg = {"stamp_keywords": {
+        "CONVGAIN": {
+            "indi_switch": "ToupTek SkyEye45AC-plus.TC_CONVERSION_GAIN",
+            "map": {"GAIN_HIGH": "HCG", "GAIN_LOW": "LCG"},
+            "comment": "Conversion gain mode",
+        },
+        "CAMGAIN": {"indi": "ToupTek SkyEye45AC-plus.CCD_CONTROLS.Gain"},
+        "SITE": {"value": "Woodbury MN"},
+        "MISSING": {"indi_switch": "Nope.NOPE"},
+    }}
+
+    values, problems = fc.resolve_stamp_keywords(stamp_cfg, indi_runner=fake_indi)
+
+    check(values["CONVGAIN"][0] == "HCG", "INDI switch stamped as HCG")
+    check(values["CAMGAIN"][0] == 100, "INDI number stamped")
+    check(values["SITE"][0] == "Woodbury MN", "constant stamped")
+    check(
+        "MISSING" not in values and len(problems) == 1,
+        "unreadable source is skipped, not fatal",
+    )
+
+    stamped = fc.stamp_header(fits.Header(), values)
+    check(
+        stamped["CONVGAIN"] == "HCG"
+        and stamped.comments["CONVGAIN"] == "Conversion gain mode",
+        "keyword and comment written to header",
+    )
+
     sent = {}
 
     class FakeResponse(io.BytesIO):
@@ -646,6 +687,7 @@ def main():
             PLAN,
             EXEC,
             NIGHTLY,
+            ROOT / "session-postcapture.py",
             ROOT / "flat_common.py",
             ROOT / "flat-calibrate.py",
             ROOT / "flat-setup.py",
