@@ -165,12 +165,75 @@ For each required group, FlatEngine:
 2. Moves the rotator if ROTSTEPS metadata exists
 3. Verifies rotation using ROTATANG
 4. Closes the flat panel
-5. Sets panel brightness
-6. Runs an ADU probe
-7. Captures fixed-exposure flats
-8. Captures matching dark-flats
-9. Verifies FITS metadata
-10. Writes a completion manifest
+5. Tunes panel brightness with fixed-exposure probes
+6. Captures fixed-exposure flats
+7. Reuses or builds a dark-flat library for that exposure
+8. Verifies FITS metadata
+9. Writes a completion manifest
+
+## Fixed-Exposure Flats
+
+Flats are shot at a fixed exposure from a short ladder of standard
+steps (`exposure_policy.ladder_seconds`, default 1, 2, 3, 5, 10, 20,
+30, 60 s). FlatEngine adjusts the panel brightness, not the
+exposure, to hit the target.
+
+    probe at learned brightness and ladder exposure
+        ->
+    measure the brightest Bayer channel
+        ->
+    adjust brightness proportionally (damped for LED nonlinearity)
+        ->
+    panel at maximum and still too dim? step up the ladder
+        ->
+    shortest exposure the panel can serve is always preferred
+
+Why:
+
+- Exposures never drop below `exposure_policy.minimum_seconds`
+  (default 1.0 s), avoiding rolling-shutter banding.
+- Standard steps keep dark-flats reusable across sessions.
+- Broadband filters land on 1 s; narrowband filters such as an
+  L-Extreme step up the ladder automatically.
+
+The target is the median of the brightest 2x2 Bayer position
+(`flat_target.brightest_channel_fraction`, default 0.64 of full
+scale, about 10,500 ADU on a 14-bit camera), measured over the
+central 80% of the frame. It does not depend on BAYERPAT, which
+some drivers write incorrectly. A saturation cap
+(`saturation_cap_fraction`, default 0.80) is enforced, and a
+warning is printed when the weakest channel falls under
+`weakest_channel_min_adu` (default 1000).
+
+The tuned brightness and exposure are saved to the filter profile
+(`brightness`, `flat_exposure`), so the next session's first probe
+usually lands in tolerance. A profile is no longer required before
+the first run: tuning starts at mid-range brightness.
+
+## Dark-Flat Library
+
+Dark-flats depend only on exposure and camera state, not on the
+optics, so FlatEngine keeps them in a library instead of shooting a
+set for every group:
+
+    <output root>/DarkFlatLibrary/
+        <camera>_G<gain>_O<offset>_B<x>x<y>_LN<lownoise>_T<temp>C_E<exp>s/
+            *_DarkFlat_*.fits
+            library.json
+
+The key includes CCD temperature rounded to
+`darkflat_library.temperature_step_c` (default 5 C) and the
+LOWNOISE header value when the driver writes one. A complete library
+is reused; a missing one is captured once.
+
+Every new capture is checked for light leaks: Bayer channels that
+differ, or a center brighter than the corners, by more than
+`darkflat_library.leak_threshold_adu` (default 5 ADU). A suspected
+leak aborts the run and the frames are NOT registered. Build
+libraries after dark, with the front end covered.
+
+Set `darkflat_library.enabled` to false to restore per-group
+dark-flats.
 
 ## Manual Filters
 

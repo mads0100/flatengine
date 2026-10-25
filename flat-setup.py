@@ -20,15 +20,35 @@ DEFAULTS = {
 
     "flat_target": {
         "mode": "fraction",
+        # Ekos ADU target used only by `flatengine calibrate`.
         "fraction": 0.50,
         "tolerance_fraction": 0.05,
+        # Nightly tuning targets the brightest Bayer channel.
+        "brightest_channel_fraction": 0.64,
+        "saturation_cap_fraction": 0.80,
+        "weakest_channel_min_adu": 1000,
+        "max_tuning_attempts": 8,
     },
 
     "exposure_policy": {
         "preferred_seconds": 1.0,
-        "minimum_seconds": 0.5,
+        # Rolling-shutter guard: never shoot flats shorter.
+        "minimum_seconds": 1.0,
         "maximum_preferred_seconds": 5.0,
         "if_longer_required": "accept_and_warn",
+        # Standard flat exposures. The panel is tuned at the
+        # shortest step; longer steps are used only when the
+        # panel cannot get bright enough (narrowband filters).
+        "ladder_seconds": [1, 2, 3, 5, 10, 20, 30, 60],
+    },
+
+    "darkflat_library": {
+        "enabled": True,
+        # Empty means <output root>/DarkFlatLibrary.
+        "root": "",
+        "frames": 30,
+        "temperature_step_c": 5,
+        "leak_threshold_adu": 5.0,
     },
 
     "frames": {
@@ -41,8 +61,9 @@ DEFAULTS = {
         "device": "Flip Flat",
         "can_power": True,
         "can_set_brightness": True,
-        "brightness_min": 0,
+        "brightness_min": 1,
         "brightness_max": 255,
+        "brightness_step": 1,
     },
 
     "capabilities": {
@@ -335,7 +356,7 @@ def main():
     config["exposure_policy"][
         "minimum_seconds"
     ] = ask_float(
-        "Minimum acceptable flat exposure",
+        "Minimum flat exposure (rolling-shutter guard; 1.0 recommended)",
         config["exposure_policy"][
             "minimum_seconds"
         ],
