@@ -5,10 +5,29 @@ import json
 from datetime import datetime, timedelta
 from astropy.io import fits
 
+# flat_common provides custom keyword stamping. Find it next to this
+# script, or in FlatEngine's installed scripts directory when Ekos
+# points at a copy kept elsewhere.
 try:
     import flat_common as fc
-except ImportError:  # running outside the installed scripts dir
-    fc = None
+except ImportError:
+    from pathlib import Path
+
+    sys.path.insert(
+        0,
+        str(Path.home() / ".local" / "share" / "flatengine" / "scripts"),
+    )
+
+    try:
+        import flat_common as fc
+    except ImportError:
+        fc = None
+        print(
+            "WARNING: flat_common not found; stamping SESSION only. "
+            "Point the Ekos post-capture script at "
+            "~/.local/share/flatengine/scripts/session-postcapture.py",
+            file=sys.stderr,
+        )
 
 
 SESSION_KEY = "SESSION"
