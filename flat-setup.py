@@ -52,7 +52,16 @@ DEFAULTS = {
     },
 
     "frames": {
+        # Minimum flats per group.
         "flats_per_group": 30,
+        # The count rises until the WEAKEST Bayer channel's master
+        # flat reaches flat_min_snr, up to flats_max_per_group.
+        "flats_max_per_group": 100,
+        "flat_min_snr": 200,
+        # Camera conversion gain at the flat gain setting
+        # (SkyEye45AC-plus HCG gain 100: 0.91).
+        "e_per_adu": 1.0,
+        "pedestal_adu": 0,
         "darkflats_enabled": True,
     },
 

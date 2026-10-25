@@ -313,6 +313,37 @@ def fixed_exposure_checks():
             "short library is not reused",
         )
 
+    count_cfg = {
+        "frames": {
+            "flats_per_group": 30,
+            "flats_max_per_group": 100,
+            "flat_min_snr": 200,
+            "e_per_adu": 0.91,
+            "pedestal_adu": 44,
+        }
+    }
+
+    count, _ = fc.flat_frame_count(
+        {"brightest": 10500, "weakest": 4194}, count_cfg,
+    )
+    check(count == 30, "broadband flat keeps the base count")
+
+    count, details = fc.flat_frame_count(
+        {"brightest": 10500, "weakest": 1000}, count_cfg,
+    )
+    check(
+        40 <= count <= 50 and details["master_snr"] >= 200,
+        f"weak red channel raises the count ({count} frames)",
+    )
+
+    count, details = fc.flat_frame_count(
+        {"brightest": 10500, "weakest": 200}, count_cfg,
+    )
+    check(
+        count == 100 and details["capped"],
+        "very weak channel is capped at the maximum",
+    )
+
     rng = np.random.default_rng(1)
     clean = rng.normal(44, 1.5, (600, 900))
 

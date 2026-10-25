@@ -717,6 +717,85 @@ def tuning_step(
 
     return False, new_brightness, new_exposure
 
+
+def flat_frame_count(levels, config):
+    """
+    Size the flat set so the WEAKEST Bayer channel's master flat
+    reaches a target signal-to-noise ratio.
+
+    Flat quality is limited by its weakest channel (red or blue
+    through a dual-band filter). Master-flat SNR grows with the
+    square root of the electrons collected, so:
+
+        frames = SNR^2 / (weakest ADU x e-/ADU)
+
+    clamped between frames.flats_per_group and
+    frames.flats_max_per_group.
+
+    Returns (count, details).
+    """
+    frames = config.get(
+        "frames",
+        {},
+    )
+
+    base = int(
+        frames.get(
+            "flats_per_group",
+            30,
+        )
+    )
+
+    maximum = max(
+        base,
+        int(
+            frames.get(
+                "flats_max_per_group",
+                100,
+            )
+        ),
+    )
+
+    snr = float(
+        frames.get(
+            "flat_min_snr",
+            200,
+        )
+    )
+
+    e_per_adu = float(
+        frames.get(
+            "e_per_adu",
+            1.0,
+        )
+    )
+
+    pedestal = float(
+        frames.get(
+            "pedestal_adu",
+            0,
+        )
+    )
+
+    signal = max(
+        1.0,
+        (levels["weakest"] - pedestal) * e_per_adu,
+    )
+
+    needed = math.ceil(snr * snr / signal)
+
+    count = max(base, min(maximum, needed))
+
+    return count, {
+        "weakest_adu": round(levels["weakest"], 1),
+        "weakest_electrons": round(signal, 1),
+        "target_snr": snr,
+        "frames_needed": needed,
+        "frames_used": count,
+        "capped": needed > maximum,
+        "master_snr": round(math.sqrt(count * signal), 1),
+    }
+
 # ---------------------------------------------------------------------
 # Dark-flat library
 #

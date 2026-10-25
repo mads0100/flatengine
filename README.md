@@ -205,6 +205,18 @@ some drivers write incorrectly. A saturation cap
 warning is printed when the weakest channel falls under
 `weakest_channel_min_adu` (default 1000).
 
+The flat count adapts to the weakest Bayer channel. Master-flat
+signal-to-noise grows with the square root of the electrons
+collected, so FlatEngine shoots
+
+    frames = flat_min_snr^2 / (weakest ADU x e_per_adu)
+
+clamped between `frames.flats_per_group` (minimum, default 30) and
+`frames.flats_max_per_group` (default 100). With the default SNR of
+200 and 0.91 e-/ADU, a broadband flat stays at 30 frames while a
+dual-band flat whose red channel sits near 1,000 ADU gets about 44.
+Set `e_per_adu` and `pedestal_adu` for your camera.
+
 The tuned brightness and exposure are saved to the filter profile
 (`brightness`, `flat_exposure`), so the next session's first probe
 usually lands in tolerance. A profile is no longer required before

@@ -957,6 +957,7 @@ def build_production_flat_queue(
     rotsteps,
     exposure,
     config,
+    count=None,
 ):
     tree = ET.parse(TEMPLATE)
     root = tree.getroot()
@@ -965,9 +966,10 @@ def build_production_flat_queue(
     if job is None:
         raise RuntimeError("Template contains no Job element.")
 
-    job.find("Count").text = str(
-        config["frames"]["flats_per_group"]
-    )
+    if count is None:
+        count = config["frames"]["flats_per_group"]
+
+    job.find("Count").text = str(int(count))
 
     target_name = job.find("TargetName")
     if target_name is not None:
@@ -1709,10 +1711,10 @@ def tune_flat_settings(
         if done:
             if levels["weakest"] < floor:
                 print(
-                    f"WARNING: weakest CFA channel "
+                    f"NOTE: weakest CFA channel "
                     f"{levels['weakest']:.0f} ADU is under "
-                    f"{floor} ADU. That channel's flat will be "
-                    "noisy; consider more flat frames."
+                    f"{floor} ADU; the flat count is raised "
+                    "to compensate."
                 )
 
             return brightness, exposure, levels, probe_file
@@ -2199,6 +2201,11 @@ def main():
         # Phase 2: production flats at the tuned settings
         # --------------------------------------------------------
 
+        flat_count, count_details = fc.flat_frame_count(
+            flat_levels,
+            config,
+        )
+
         flat_dir = build_production_flat_queue(
             session=args.session,
             profile=profile,
@@ -2209,6 +2216,7 @@ def main():
             rotsteps=rotsteps,
             exposure=exposure,
             config=config,
+            count=flat_count,
         )
 
         print()
@@ -2221,6 +2229,20 @@ def main():
         print(
             f"Brightness: {brightness}"
         )
+        print(
+            f"Frames:     {flat_count} "
+            f"(weakest channel {count_details['weakest_adu']:.0f} ADU, "
+            f"master SNR {count_details['master_snr']:.0f} "
+            f"vs target {count_details['target_snr']:.0f})"
+        )
+
+        if count_details["capped"]:
+            print(
+                f"WARNING: {count_details['frames_needed']} frames "
+                "needed for the target SNR; capped at "
+                f"{flat_count} by frames.flats_max_per_group."
+            )
+
         print(
             f"Output:     {flat_dir}"
         )
@@ -2237,9 +2259,7 @@ def main():
         flat_files = verify_new_flats(
             flat_dir,
             profile,
-            config["frames"][
-                "flats_per_group"
-            ],
+            flat_count,
             flat_started,
             args.session,
         )
@@ -2295,7 +2315,10 @@ def main():
         exposure=exposure,
         flat_files=flat_files,
         darkflat_files=darkflat_files,
-        flat_levels=flat_levels,
+        flat_levels=dict(
+            flat_levels,
+            frame_count=count_details,
+        ),
         target_adu=target_adu,
         darkflat_library=library_dir,
     )
