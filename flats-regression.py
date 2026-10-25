@@ -530,6 +530,45 @@ def fixed_exposure_checks():
                 results[0][2] == "missing",
                 "lights without darks are flagged",
             )
+
+            # Old-state darks exist: the reason names the differences.
+            old_state = hdr.copy()
+            old_state["OFFSET"] = 0
+            old_state["LOWNOISE"] = "OFF"
+            old_key, old_rec = fc.dark_record_from_header(old_state, cat_cfg)
+            fc.catalog_register(old_key, dict(old_rec, count=30))
+
+            reason = fc.light_dark_requirements(
+                tmp / "Pictures", "20991231", cat_cfg,
+            )[0][2]
+
+            check(
+                "OFFSET 0 -> 40" in reason and "LOWNOISE OFF -> ON" in reason,
+                f"mismatch is explained ({reason})",
+            )
+
+            # Extra keywords join the match when configured.
+            extra_cfg = dict(cat_cfg, calibration_catalog={
+                "max_age_days": 365,
+                "extra_match_keywords": ["READMODE"],
+            })
+            hcg = hdr.copy()
+            hcg["READMODE"] = "HCG"
+            lcg = hdr.copy()
+            lcg["READMODE"] = "LCG"
+            k_hcg, _ = fc.dark_record_from_header(hcg, extra_cfg)
+            k_lcg, r_lcg = fc.dark_record_from_header(lcg, extra_cfg)
+
+            check(k_hcg != k_lcg, "extra keyword separates catalog keys")
+
+            fc.catalog_register(k_lcg, dict(r_lcg, count=30))
+            _, r_hcg = fc.dark_record_from_header(hcg, extra_cfg)
+
+            check(
+                "READMODE LCG -> HCG" in fc.catalog_check(
+                    k_hcg, 30, extra_cfg, want=r_hcg)[1],
+                "extra keyword mismatch is explained",
+            )
         finally:
             fc.CATALOG_FILE = saved_catalog
 

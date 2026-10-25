@@ -120,6 +120,7 @@ def add_requests(config, exposures, like):
 
         _, problem = fc.catalog_check(
             key, count, config, firmware=record.get("firmware"),
+            want=record,
         )
 
         if problem is None:

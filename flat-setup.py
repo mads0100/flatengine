@@ -94,6 +94,10 @@ DEFAULTS = {
         "max_age_days": 365,
         # Empty means <output root>/DarkLibrary.
         "darks_root": "",
+        # Extra FITS keywords that must match between lights and
+        # darks, if your driver records more camera state
+        # (e.g. a readout or conversion-gain mode).
+        "extra_match_keywords": [],
     },
 
     "notify": {

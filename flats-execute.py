@@ -1945,6 +1945,7 @@ def acquire_darkflats(
             count,
             config,
             firmware=catalog_record.get("firmware"),
+            want=catalog_record,
         )
 
         if problem is None:
@@ -1970,7 +1971,7 @@ def acquire_darkflats(
             count,
         )
 
-        if existing and problem == "missing":
+        if existing and problem.startswith("missing"):
             fc.catalog_register(
                 catalog_key,
                 dict(

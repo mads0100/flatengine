@@ -1430,19 +1430,118 @@ def catalog_remove(key):
     return True
 
 
+# Header-derived fields that must match between lights/flats and
+# their darks, with the FITS keyword shown in explanations.
+MATCH_FIELDS = [
+    ("camera", "INSTRUME"),
+    ("gain", "GAIN"),
+    ("offset", "OFFSET"),
+    ("xbin", "XBINNING"),
+    ("ybin", "YBINNING"),
+    ("exposure", "EXPTIME"),
+    ("lownoise", "LOWNOISE"),
+    ("temperature_band_c", "CCD-TEMP band"),
+]
+
+
+def extra_match_keywords(config):
+    """
+    Additional FITS keywords that must match, for drivers that
+    record more camera state (e.g. a readout or conversion-gain
+    mode). Set calibration_catalog.extra_match_keywords.
+    """
+    return [
+        str(keyword).upper()
+        for keyword in config.get(
+            "calibration_catalog",
+            {},
+        ).get(
+            "extra_match_keywords",
+            [],
+        )
+    ]
+
+
+def _same(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return str(a).strip() == str(b).strip()
+
+
+def explain_difference(want, have):
+    """Human-readable list of fields where `have` differs from `want`."""
+    diffs = []
+
+    for field, label in MATCH_FIELDS:
+        if not _same(want.get(field), have.get(field)):
+            diffs.append(
+                f"{label} {have.get(field)} -> {want.get(field)}"
+            )
+
+    want_extra = want.get("extra", {}) or {}
+    have_extra = have.get("extra", {}) or {}
+
+    for keyword in sorted(set(want_extra) | set(have_extra)):
+        if not _same(want_extra.get(keyword), have_extra.get(keyword)):
+            diffs.append(
+                f"{keyword} {have_extra.get(keyword)} -> "
+                f"{want_extra.get(keyword)}"
+            )
+
+    return diffs
+
+
+def closest_catalog_entry(want, darks):
+    """
+    The cataloged set needing the fewest changes to match `want`,
+    preferring the same camera. Returns (key, diffs) or (None, []).
+    """
+    best = (None, None)
+
+    for key, have in darks.items():
+        diffs = explain_difference(want, have)
+        same_camera = _same(want.get("camera"), have.get("camera"))
+        score = (0 if same_camera else 1, len(diffs))
+
+        if best[0] is None or score < best[0]:
+            best = (score, (key, diffs))
+
+    if best[1] is None:
+        return None, []
+
+    return best[1]
+
+
 def catalog_check(
     key,
     count,
     config,
     firmware=None,
+    want=None,
 ):
     """
     Return (record, problem). problem is None when the catalog has
-    a usable set; otherwise a short reason to rebuild it.
+    a usable set; otherwise a short reason to rebuild it. With
+    `want` (the required record built from FITS headers), a missing
+    set's reason names how the closest cataloged set differs.
     """
-    record = load_catalog()["darks"].get(key)
+    darks = load_catalog()["darks"]
+    record = darks.get(key)
 
     if record is None:
+        if want:
+            _, diffs = closest_catalog_entry(want, darks)
+
+            if diffs:
+                return None, (
+                    "missing; closest cataloged set differs: "
+                    + ", ".join(diffs)
+                )
+
         return None, "missing"
 
     if int(record.get("count", 0)) < int(count):
@@ -1517,6 +1616,15 @@ def dark_record_from_header(
         else hdr.get("EXPTIME")
     )
 
+    extras = {
+        keyword: (
+            None
+            if hdr.get(keyword) is None
+            else str(hdr.get(keyword)).strip()
+        )
+        for keyword in extra_match_keywords(config)
+    }
+
     record = {
         "camera": hdr.get("INSTRUME"),
         "gain": hdr.get("GAIN"),
@@ -1544,6 +1652,13 @@ def dark_record_from_header(
         lownoise=record["lownoise"],
         ccd_temp=hdr.get("CCD-TEMP"),
     )
+
+    if extras:
+        record["extra"] = extras
+        key += "".join(
+            f"_{_safe_name(keyword)}{_safe_name(value)}"
+            for keyword, value in sorted(extras.items())
+        )
 
     return key, record
 
@@ -1605,6 +1720,7 @@ def light_dark_requirements(
             count,
             config,
             firmware=record.get("firmware"),
+            want=record,
         )
 
         results.append((key, record, problem, lights))

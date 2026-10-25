@@ -319,6 +319,18 @@ pending and announced by Pushover, e.g.:
     FlatEngine: darks needed for lights
     [light dark] 30 x 120 s  G100 O40 B1x1  LowNoise ON  ~-10 C (missing)
 
+Requirements are read from the FITS headers of the lights (and of
+that night's flat probe for dark-flats), and compared against the
+headers recorded for each cataloged set. When no set matches, the
+message names how the closest set differs, for example:
+
+    missing; closest cataloged set differs: OFFSET 0 -> 40, LOWNOISE OFF -> ON
+
+If your driver records more camera state (a readout or
+conversion-gain mode), add those keywords to
+`calibration_catalog.extra_match_keywords` and they become part of
+the match.
+
 Useful commands:
 
     flatengine catalog                 # list sets and their status
