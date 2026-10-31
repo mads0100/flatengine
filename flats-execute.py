@@ -37,6 +37,27 @@ FLAT_DEVICE = None
 
 KSTARS_DEST = None
 
+# Custom keywords (flat-config.json "stamp_keywords") resolved once
+# per run and stamped into every frame FlatEngine captures.
+STAMP_VALUES = {}
+
+
+def resolve_stamps(config):
+    global STAMP_VALUES
+
+    STAMP_VALUES, problems = fc.resolve_stamp_keywords(config)
+
+    if STAMP_VALUES:
+        print(
+            "Stamping: "
+            + ", ".join(f"{k}={v[0]}" for k, v in STAMP_VALUES.items())
+        )
+
+    for problem in problems:
+        print(f"WARNING: stamp keyword skipped: {problem}")
+
+    return STAMP_VALUES
+
 
 def run(cmd, check=True):
     result = subprocess.run(
@@ -880,7 +901,7 @@ def build_probe_queue(
     xbin,
     ybin,
     rotsteps,
-    profile_data,
+    exposure,
     config,
 ):
     tree = ET.parse(TEMPLATE)
@@ -930,21 +951,13 @@ def build_probe_queue(
 
     job.find("PlaceholderFormat").text = prefix
 
-    flat_duration = job.find("./Calibration/FlatDuration")
-    flat_duration.set("dark", "false")
-
-    type_node = flat_duration.find("Type")
-    type_node.text = "ADU"
-
-    value_node = flat_duration.find("Value")
-    value_node.text = str(profile_data["target_adu"])
-
-    tolerance = round(
-        profile_data["target_adu"]
-        * config["flat_target"]["tolerance_fraction"]
+    # Fixed exposure: FlatEngine tunes the panel brightness itself
+    # instead of letting Ekos float the exposure to hit an ADU.
+    set_manual_flat_duration(
+        job,
+        exposure,
+        dark=False,
     )
-
-    flat_duration.find("Tolerance").text = str(tolerance)
 
     tree.write(
         PROBE_QUEUE,
@@ -965,6 +978,7 @@ def build_production_flat_queue(
     rotsteps,
     exposure,
     config,
+    count=None,
 ):
     tree = ET.parse(TEMPLATE)
     root = tree.getroot()
@@ -973,9 +987,10 @@ def build_production_flat_queue(
     if job is None:
         raise RuntimeError("Template contains no Job element.")
 
-    job.find("Count").text = str(
-        config["frames"]["flats_per_group"]
-    )
+    if count is None:
+        count = config["frames"]["flats_per_group"]
+
+    job.find("Count").text = str(int(count))
 
     target_name = job.find("TargetName")
     if target_name is not None:
@@ -1040,6 +1055,8 @@ def build_darkflat_queue(
     rotsteps,
     exposure,
     config,
+    dark_dir=None,
+    count=None,
 ):
     tree = ET.parse(TEMPLATE)
     root = tree.getroot()
@@ -1051,9 +1068,10 @@ def build_darkflat_queue(
     type_node = job.find("Type")
     type_node.text = "Dark"
 
-    job.find("Count").text = str(
-        config["frames"]["flats_per_group"]
-    )
+    if count is None:
+        count = config["frames"]["flats_per_group"]
+
+    job.find("Count").text = str(int(count))
 
     target_name = job.find("TargetName")
     if target_name is not None:
@@ -1074,22 +1092,37 @@ def build_darkflat_queue(
         rotsteps,
     )
 
-    dark_dir = group_root / "darkflats"
+    library = dark_dir is not None
+
+    if dark_dir is None:
+        dark_dir = group_root / "darkflats"
+
+    dark_dir = Path(dark_dir)
     dark_dir.mkdir(parents=True, exist_ok=True)
 
     job.find("FITSDirectory").text = str(dark_dir)
 
-    rotation_text = ""
-    if rotsteps is not None:
-        rotation_text = f"_R{fmt_number(rotsteps)}"
+    if library:
+        # Library dark-flats are shared across sessions and
+        # filters, so the name carries only the camera state.
+        prefix = (
+            f"G{fmt_number(gain)}"
+            f"_O{fmt_number(offset)}"
+            f"_B{fmt_number(xbin)}x{fmt_number(ybin)}"
+            f"_E{fmt_number(exposure)}_DarkFlat"
+        )
+    else:
+        rotation_text = ""
+        if rotsteps is not None:
+            rotation_text = f"_R{fmt_number(rotsteps)}"
 
-    prefix = (
-        f"{session}_{profile}"
-        f"_G{fmt_number(gain)}"
-        f"_O{fmt_number(offset)}"
-        f"_B{fmt_number(xbin)}x{fmt_number(ybin)}"
-        f"{rotation_text}_DarkFlat"
-    )
+        prefix = (
+            f"{session}_{profile}"
+            f"_G{fmt_number(gain)}"
+            f"_O{fmt_number(offset)}"
+            f"_B{fmt_number(xbin)}x{fmt_number(ybin)}"
+            f"{rotation_text}_E{fmt_number(exposure)}_DarkFlat"
+        )
 
     job.find("PlaceholderFormat").text = prefix
 
@@ -1244,6 +1277,8 @@ def read_probe_result(
             "Observing-night session identifier"
         )
 
+        fc.stamp_header(hdr, STAMP_VALUES)
+
         hdul.flush()
 
     print(
@@ -1273,6 +1308,10 @@ def write_run_manifest(
     exposure,
     flat_files,
     darkflat_files,
+    flat_levels=None,
+    target_adu=None,
+    darkflat_library=None,
+    darkflats_pending=False,
 ):
     manifest = {
         "session": session,
@@ -1287,6 +1326,14 @@ def write_run_manifest(
         "rotsteps": rotsteps,
         "brightness": brightness,
         "exposure": exposure,
+        "target_adu": target_adu,
+        "flat_levels": flat_levels,
+        "darkflat_library": (
+            str(darkflat_library)
+            if darkflat_library is not None
+            else None
+        ),
+        "darkflats_pending": bool(darkflats_pending),
         "status": "complete",
         "flats": [
             str(path)
@@ -1323,6 +1370,7 @@ def verify_new_darkflats(
     started,
     session,
     expected_exposure,
+    stamp_session=True,
 ):
     candidates = []
 
@@ -1398,10 +1446,13 @@ def verify_new_darkflats(
                 )
                 continue
 
-            hdr["SESSION"] = (
-                session,
-                "Observing-night session identifier"
-            )
+            if stamp_session:
+                hdr["SESSION"] = (
+                    session,
+                    "Observing-night session identifier"
+                )
+
+            fc.stamp_header(hdr, STAMP_VALUES)
 
             hdul.flush()
 
@@ -1484,6 +1535,7 @@ def verify_new_flats(
                 session,
                 "Observing-night session identifier"
             )
+            fc.stamp_header(hdul[0].header, STAMP_VALUES)
             hdul.flush()
 
     if bad:
@@ -1502,6 +1554,636 @@ def verify_new_flats(
     )
 
     return sorted(candidates)
+
+
+# ---------------------------------------------------------------------
+# Fixed-exposure tuning and dark-flat library
+# ---------------------------------------------------------------------
+
+def run_queue(queue_path, queue_name):
+    load_queue(
+        queue_path,
+        queue_name,
+    )
+
+    started = time.time()
+
+    result = dbus(
+        "start",
+        TRAIN
+    )
+
+    print(
+        f"Ekos start: {result}"
+    )
+
+    wait_for_completion()
+
+    return started
+
+
+def panel_limits(config):
+    panel = config.get(
+        "panel",
+        {},
+    )
+
+    # 0 means "off" on most panels, so never tune down to it.
+    b_min = max(
+        1,
+        int(panel.get("brightness_min", 1)),
+    )
+
+    b_max = int(
+        panel.get("brightness_max", 255)
+    )
+
+    b_step = int(
+        panel.get("brightness_step", 1)
+    )
+
+    return b_min, b_max, b_step
+
+
+def tune_flat_settings(
+    session,
+    profile,
+    gain,
+    offset,
+    xbin,
+    ybin,
+    rotsteps,
+    profile_data,
+    config,
+):
+    """
+    Probe at a fixed ladder exposure and adjust panel brightness
+    until the brightest CFA channel lands on target. Step the
+    exposure up the ladder only when the panel runs out.
+
+    Returns (brightness, exposure, levels, probe_file).
+    """
+    ladder = fc.exposure_ladder(config)
+
+    bits = int(
+        profile_data.get("camera_bits", 14)
+    )
+
+    target, tolerance, cap, floor = fc.flat_targets(
+        config,
+        bits,
+    )
+
+    accept_floor = fc.flat_floor(
+        config,
+        bits,
+    )
+
+    b_min, b_max, b_step = panel_limits(config)
+
+    max_attempts = int(
+        config.get(
+            "flat_target",
+            {},
+        ).get(
+            "max_tuning_attempts",
+            8,
+        )
+    )
+
+    exposure = fc.snap_to_ladder(
+        profile_data.get("flat_exposure"),
+        ladder,
+    )
+
+    brightness = fc.quantize_brightness(
+        profile_data.get(
+            "brightness",
+            (b_min + b_max) // 2,
+        ),
+        b_min,
+        b_max,
+        b_step,
+    )
+
+    print()
+    print("=" * 72)
+    print("PHASE 1: FIXED-EXPOSURE PANEL TUNING")
+    print("=" * 72)
+    print(
+        f"Target:     brightest CFA channel {target} ADU "
+        f"± {tolerance * 100:.0f}%"
+    )
+    print(
+        f"Cap:        {cap} ADU   "
+        f"Weak-channel floor: {floor} ADU"
+    )
+    print(
+        "Accept:     "
+        + (
+            f"down to {accept_floor} ADU at full brightness "
+            "before lengthening the exposure"
+            if accept_floor is not None
+            else "target only (min_brightest_fraction = 0)"
+        )
+    )
+    print(
+        "Ladder:     "
+        + ", ".join(f"{step:g} s" for step in ladder)
+    )
+    print(
+        f"Panel:      {b_min}-{b_max} (step {b_step})"
+    )
+
+    blocked = set()
+
+    for attempt in range(1, max_attempts + 1):
+        set_brightness(brightness)
+
+        probe_dir = build_probe_queue(
+            session=session,
+            profile=profile,
+            gain=gain,
+            offset=offset,
+            xbin=xbin,
+            ybin=ybin,
+            rotsteps=rotsteps,
+            exposure=exposure,
+            config=config,
+        )
+
+        light_on()
+
+        started = run_queue(
+            PROBE_QUEUE,
+            "FlatProbe",
+        )
+
+        probe_file, _ = read_probe_result(
+            probe_dir,
+            started,
+            profile,
+            session,
+        )
+
+        levels = fc.read_cfa_levels(
+            probe_file,
+            bits,
+        )
+
+        print(
+            f"Probe {attempt}: brightness {brightness:>3}  "
+            f"exposure {exposure:g} s  "
+            f"brightest {levels['brightest']:.0f}  "
+            f"weakest {levels['weakest']:.0f} ADU"
+        )
+
+        done, next_brightness, next_exposure = fc.tuning_step(
+            brightness=brightness,
+            exposure=exposure,
+            levels=levels,
+            target=target,
+            tolerance=tolerance,
+            cap=cap,
+            ladder=ladder,
+            b_min=b_min,
+            b_max=b_max,
+            b_step=b_step,
+            blocked=blocked,
+            floor=accept_floor,
+            weak_floor=floor + float(
+                config.get("frames", {}).get("pedestal_adu", 0)
+            ),
+        )
+
+        if done:
+            pedestal = float(
+                config.get("frames", {}).get("pedestal_adu", 0)
+            )
+
+            error_pct = fc.additive_error_percent(
+                levels,
+                error_adu=2.0,
+                pedestal=pedestal,
+            )
+
+            levels = dict(levels)
+            levels["accepted_below_target"] = (
+                levels["brightest"] < target * (1 - tolerance)
+            )
+            levels["additive_error_2adu_percent"] = round(
+                error_pct,
+                3,
+            )
+
+            print()
+            print("FLAT LEVEL ANALYSIS")
+            print(
+                f"  Brightest channel: {levels['brightest']:.0f} ADU "
+                f"({100 * levels['brightest'] / ((2 ** bits) - 1):.0f}% "
+                f"of full scale; target {target})"
+            )
+            print(
+                f"  Weakest channel:   {levels['weakest']:.0f} ADU"
+            )
+            print(
+                f"  A 2 ADU calibration error = {error_pct:.3f}% "
+                "of the weakest channel"
+            )
+
+            if levels["accepted_below_target"]:
+                print(
+                    f"  Accepted below target at full brightness to "
+                    f"hold {exposure:g} s; the frame count compensates."
+                )
+
+            if levels["weakest"] < floor:
+                print(
+                    f"  NOTE: weakest channel under {floor} ADU; "
+                    "the flat count is raised to compensate."
+                )
+
+            if error_pct > 0.2:
+                print(
+                    "  WARNING: this flat is sensitive to small "
+                    "calibration errors (over 0.2% per 2 ADU). Match "
+                    "dark-flats exactly and avoid light leaks."
+                )
+
+            return brightness, exposure, levels, probe_file
+
+        brightness = next_brightness
+        exposure = next_exposure
+
+    raise RuntimeError(
+        "PANEL TUNING DID NOT CONVERGE\n"
+        f"No setting reached {target} ADU ± "
+        f"{tolerance * 100:.0f}% in {max_attempts} probes.\n"
+        "Raise flat_target.max_tuning_attempts or check the "
+        "panel's brightness response."
+    )
+
+
+def save_learned_profile(
+    profile,
+    brightness,
+    exposure,
+    target,
+):
+    """
+    Remember the tuned brightness and ladder exposure so the next
+    session's first probe usually lands in tolerance.
+    """
+    profiles = load_json(PROFILES)
+
+    entry = profiles.get(profile, {})
+
+    entry.update(
+        {
+            "brightness": int(brightness),
+            "flat_exposure": float(exposure),
+            "last_success_exposure": float(exposure),
+            "target_adu": int(target),
+            "target_metric": "brightest_cfa_channel",
+            "updated": time.strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            ),
+        }
+    )
+
+    profiles[profile] = entry
+
+    PROFILES.write_text(
+        json.dumps(
+            profiles,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+    print(
+        f"Profile updated: {profile} -> brightness "
+        f"{brightness}, exposure {exposure:g} s"
+    )
+
+
+def acquire_darkflats(
+    session,
+    profile,
+    camera,
+    gain,
+    offset,
+    xbin,
+    ybin,
+    rotsteps,
+    exposure,
+    probe_file,
+    config,
+):
+    """
+    Return (darkflat_files, library_dir_or_None, pending).
+
+    With the library enabled (default), dark-flats are reused
+    from a library keyed on camera state and exposure. When no
+    complete library exists, darkflat_library.on_missing decides:
+
+      "notify"  (default) record the request, send a Pushover
+                message and continue without dark-flats; build
+                it later with `flatengine darkflats --build`
+      "capture" capture the library now, unattended
+
+    A light-leak check guards every new capture.
+    """
+    lib_cfg = config.get(
+        "darkflat_library",
+        {},
+    )
+
+    use_library = lib_cfg.get(
+        "enabled",
+        True,
+    )
+
+    count = int(
+        lib_cfg.get(
+            "frames",
+            config["frames"]["flats_per_group"],
+        )
+    )
+
+    leak_threshold = float(
+        lib_cfg.get(
+            "leak_threshold_adu",
+            5.0,
+        )
+    )
+
+    with fits.open(
+        probe_file,
+        memmap=False,
+    ) as hdul:
+        hdr = hdul[0].header.copy()
+        ccd_temp = hdr.get("CCD-TEMP")
+        lownoise = hdr.get("LOWNOISE")
+
+    catalog_key, catalog_record = fc.dark_record_from_header(
+        hdr,
+        config,
+        exposure=exposure,
+        defaults={
+            "INSTRUME": camera,
+            "GAIN": gain,
+            "OFFSET": offset,
+            "XBINNING": xbin,
+            "YBINNING": ybin,
+        },
+    )
+    catalog_record["count"] = count
+
+    print()
+    print("=" * 72)
+    print("PHASE 3: DARK-FLATS")
+    print("=" * 72)
+    print(
+        f"Exposure: {exposure:g} s"
+    )
+
+    library_dir = None
+
+    if use_library:
+        library_dir = fc.darkflat_library_dir(
+            config,
+            camera,
+            gain,
+            offset,
+            xbin,
+            ybin,
+            exposure,
+            lownoise=lownoise,
+            ccd_temp=ccd_temp,
+        )
+
+        # The catalog is the source of truth: the files may have
+        # been moved to a processing machine.
+        record, problem = fc.catalog_check(
+            catalog_key,
+            count,
+            config,
+            firmware=catalog_record.get("firmware"),
+            want=catalog_record,
+        )
+
+        if problem is None:
+            print(
+                f"Reusing cataloged dark-flats: {catalog_key}"
+            )
+            print(
+                f"Frames: {record.get('count')}  built "
+                f"{record.get('built')}  at "
+                f"{record.get('location', 'unknown')}"
+            )
+
+            return (
+                [Path(f) for f in record.get("files", [])],
+                library_dir,
+                False,
+            )
+
+        # A complete library still on disk but never cataloged
+        # (built before the catalog existed) is registered once.
+        existing = fc.library_files(
+            library_dir,
+            count,
+        )
+
+        if existing and problem.startswith("missing"):
+            fc.catalog_register(
+                catalog_key,
+                dict(
+                    catalog_record,
+                    count=len(existing),
+                    location=str(library_dir),
+                    files=[str(f) for f in existing],
+                    source="flatengine",
+                ),
+            )
+
+            print(
+                f"Cataloged existing dark-flat library: {library_dir}"
+            )
+
+            return existing, library_dir, False
+
+        print(
+            f"Dark-flats needed for {exposure:g} s: {problem}."
+        )
+
+        on_missing = str(
+            lib_cfg.get(
+                "on_missing",
+                "notify",
+            )
+        ).lower()
+
+        if on_missing == "notify":
+            details = dict(
+                catalog_record,
+                count=count,
+                profile=profile,
+                kind="dark-flat",
+                reason=problem,
+                catalog_key=catalog_key,
+            )
+
+            record, due = fc.record_pending_darkflats(
+                library_dir,
+                details,
+                session,
+                repeat_hours=config.get(
+                    "notify",
+                    {},
+                ).get(
+                    "repeat_hours",
+                    24,
+                ),
+            )
+
+            print(
+                "Recorded as pending (not captured):"
+            )
+            print(
+                f"  {fc.describe_pending(record)}"
+            )
+            print(
+                f"  {library_dir}"
+            )
+            print(
+                "Build it after dark with: "
+                "flatengine darkflats --build"
+            )
+
+            if due:
+                fc.notify(
+                    config,
+                    "FlatEngine: dark-flats needed",
+                    (
+                        f"{profile} flats (session {session}): "
+                        f"{problem}.\n"
+                        f"Shoot {fc.describe_pending(record)}.\n"
+                        "After dark, front end covered: "
+                        "flatengine darkflats --build"
+                    ),
+                )
+
+            return [], library_dir, True
+
+        print(
+            f"No complete library; building: {library_dir}"
+        )
+
+    # Panel must be off for dark-flats.
+    light_off()
+
+    dark_dir = build_darkflat_queue(
+        session=session,
+        profile=profile,
+        gain=gain,
+        offset=offset,
+        xbin=xbin,
+        ybin=ybin,
+        rotsteps=rotsteps,
+        exposure=exposure,
+        config=config,
+        dark_dir=library_dir,
+        count=count,
+    )
+
+    print(
+        f"Output:   {dark_dir}"
+    )
+
+    started = run_queue(
+        DARKFLAT_QUEUE,
+        "DarkFlatProduction",
+    )
+
+    darkflat_files = verify_new_darkflats(
+        dark_dir,
+        count,
+        started,
+        session,
+        exposure,
+        stamp_session=not use_library,
+    )
+
+    with fits.open(
+        darkflat_files[0],
+        memmap=False,
+    ) as hdul:
+        leak = fc.light_leak_report(
+            hdul[0].data,
+            leak_threshold,
+        )
+
+    print(
+        f"Leak check: channel spread "
+        f"{leak['channel_spread_adu']} ADU, "
+        f"center minus corners "
+        f"{leak['center_minus_corners_adu']} ADU "
+        f"(limit {leak_threshold:g})"
+    )
+
+    if leak["suspected"]:
+        fc.notify(
+            config,
+            "FlatEngine: light leak in dark-flats",
+            (
+                f"{exposure:g} s dark-flats rejected: channel "
+                f"spread {leak['channel_spread_adu']} ADU, center "
+                f"minus corners {leak['center_minus_corners_adu']} "
+                "ADU. Not added to the library."
+            ),
+            priority=1,
+        )
+
+        raise RuntimeError(
+            "LIGHT LEAK SUSPECTED IN DARK-FLATS\n"
+            f"Channel spread {leak['channel_spread_adu']} ADU, "
+            f"center minus corners "
+            f"{leak['center_minus_corners_adu']} ADU.\n"
+            "Cover the front end and camera, or shoot after "
+            "dark. The frames were kept but NOT registered as a "
+            f"library:\n{dark_dir}"
+        )
+
+    if use_library:
+        manifest = fc.write_library_manifest(
+            library_dir,
+            darkflat_files,
+            exposure,
+            leak,
+        )
+
+        print(
+            f"Library registered: {manifest}"
+        )
+
+        fc.catalog_register(
+            catalog_key,
+            dict(
+                catalog_record,
+                count=len(darkflat_files),
+                location=str(library_dir),
+                files=[str(f) for f in darkflat_files],
+                source="flatengine",
+            ),
+        )
+
+        fc.clear_pending(library_dir)
+
+    return darkflat_files, library_dir, False
+
 
 
 def main():
@@ -1550,12 +2232,15 @@ def main():
         config
     )
 
+    resolve_stamps(config)
+
     profiles = load_json(PROFILES)
 
     if args.profile not in profiles:
-        raise RuntimeError(
-            f"No calibrated profile exists for "
-            f"{args.profile!r}."
+        print(
+            f"No learned profile for {args.profile!r}; "
+            "tuning starts from mid-range brightness at the "
+            "shortest ladder exposure."
         )
 
     groups = fc.find_session_groups(
@@ -1632,7 +2317,12 @@ def main():
         lights
     )
 
-    profile_data = profiles[profile]
+    profile_data = profiles.get(profile, {})
+
+    target_adu, _, _, _ = fc.flat_targets(
+        config,
+        profile_data.get("camera_bits", 14),
+    )
 
     print()
     print("=" * 72)
@@ -1663,35 +2353,19 @@ def main():
     print(f"Matching lights: {len(lights)}")
     print(
         f"Brightness:    "
-        f"{profile_data['brightness']}"
+        f"{profile_data.get('brightness', 'not yet learned')}"
+    )
+    print(
+        f"Exposure:      "
+        f"{profile_data.get('flat_exposure', 'not yet learned')}"
     )
     print(
         f"Target ADU:    "
-        f"{profile_data['target_adu']}"
+        f"{target_adu} (brightest CFA channel)"
     )
     print(
         f"Flat count:    "
         f"{config['frames']['flats_per_group']}"
-    )
-    print()
-
-    probe_dir = build_probe_queue(
-        session=args.session,
-        profile=profile,
-        gain=gain,
-        offset=offset,
-        xbin=xbin,
-        ybin=ybin,
-        rotsteps=rotsteps,
-        profile_data=profile_data,
-        config=config,
-    )
-
-    print(
-        f"Probe queue:     {PROBE_QUEUE}"
-    )
-    print(
-        f"Probe output:    {probe_dir}"
     )
     print()
 
@@ -1734,124 +2408,45 @@ def main():
 
     ensure_cover_closed()
 
-    set_brightness(
-        int(profile_data["brightness"])
-    )
-
     # ------------------------------------------------------------
-    # Phase 1: one ADU-controlled probe
+    # Phase 1: tune panel brightness at a fixed ladder exposure
     # ------------------------------------------------------------
-
-    print()
-    print("=" * 72)
-    print("PHASE 1: ADU PROBE")
-    print("=" * 72)
-
-    light_on()
 
     try:
-        load_queue(
-            PROBE_QUEUE,
-            "FlatProbe",
+        (
+            brightness,
+            exposure,
+            flat_levels,
+            probe_file,
+        ) = tune_flat_settings(
+            session=args.session,
+            profile=profile,
+            gain=gain,
+            offset=offset,
+            xbin=xbin,
+            ybin=ybin,
+            rotsteps=rotsteps,
+            profile_data=profile_data,
+            config=config,
         )
 
-        probe_started = time.time()
-
-        result = dbus(
-            "start",
-            TRAIN
-        )
-
-        print(
-            f"Ekos start: {result}"
-        )
-
-        wait_for_completion()
-
-        probe_file, exposure = (
-            read_probe_result(
-                probe_dir,
-                probe_started,
-                profile,
-                args.session,
-            )
-        )
-
-    finally:
-        # Leave the panel on only long enough to transition
-        # into the production-flat phase below.
-        pass
-
-    # ------------------------------------------------------------
-    # Phase 2: production flats at FIXED probe exposure
-    # ------------------------------------------------------------
-
-    flat_dir = build_production_flat_queue(
-        session=args.session,
-        profile=profile,
-        gain=gain,
-        offset=offset,
-        xbin=xbin,
-        ybin=ybin,
-        rotsteps=rotsteps,
-        exposure=exposure,
-        config=config,
-    )
-
-    print()
-    print("=" * 72)
-    print("PHASE 2: FIXED-EXPOSURE FLATS")
-    print("=" * 72)
-    print(
-        f"Exposure: {exposure:.7f} s"
-    )
-    print(
-        f"Output:   {flat_dir}"
-    )
-
-    try:
-        load_queue(
-            EXEC_QUEUE,
-            "FlatProduction",
-        )
-
-        flat_started = time.time()
-
-        result = dbus(
-            "start",
-            TRAIN
-        )
-
-        print(
-            f"Ekos start: {result}"
-        )
-
-        wait_for_completion()
-
-        flat_files = verify_new_flats(
-            flat_dir,
+        save_learned_profile(
             profile,
-            config["frames"][
-                "flats_per_group"
-            ],
-            flat_started,
-            args.session,
+            brightness,
+            exposure,
+            target_adu,
         )
 
-    finally:
-        light_off()
+        # --------------------------------------------------------
+        # Phase 2: production flats at the tuned settings
+        # --------------------------------------------------------
 
-    # ------------------------------------------------------------
-    # Phase 3: matching dark-flats
-    # ------------------------------------------------------------
+        flat_count, count_details = fc.flat_frame_count(
+            flat_levels,
+            config,
+        )
 
-    if config[
-        "frames"
-    ].get(
-        "darkflats_enabled",
-        True
-    ):
-        dark_dir = build_darkflat_queue(
+        flat_dir = build_production_flat_queue(
             session=args.session,
             profile=profile,
             gain=gain,
@@ -1861,48 +2456,83 @@ def main():
             rotsteps=rotsteps,
             exposure=exposure,
             config=config,
+            count=flat_count,
         )
 
         print()
         print("=" * 72)
-        print("PHASE 3: MATCHING DARK-FLATS")
+        print("PHASE 2: FIXED-EXPOSURE FLATS")
         print("=" * 72)
         print(
-            f"Exposure: {exposure:.7f} s"
+            f"Exposure:   {exposure:g} s"
         )
         print(
-            f"Output:   {dark_dir}"
+            f"Brightness: {brightness}"
+        )
+        print(
+            f"Frames:     {flat_count} "
+            f"(weakest channel {count_details['weakest_adu']:.0f} ADU, "
+            f"master SNR {count_details['master_snr']:.0f} "
+            f"vs target {count_details['target_snr']:.0f})"
         )
 
-        # Panel must remain off for dark-flats.
+        if count_details["capped"]:
+            print(
+                f"WARNING: {count_details['frames_needed']} frames "
+                "needed for the target SNR; capped at "
+                f"{flat_count} by frames.flats_max_per_group."
+            )
+
+        print(
+            f"Output:     {flat_dir}"
+        )
+
+        set_brightness(brightness)
+
+        light_on()
+
+        flat_started = run_queue(
+            EXEC_QUEUE,
+            "FlatProduction",
+        )
+
+        flat_files = verify_new_flats(
+            flat_dir,
+            profile,
+            flat_count,
+            flat_started,
+            args.session,
+        )
+
+    finally:
         light_off()
 
-        load_queue(
-            DARKFLAT_QUEUE,
-            "DarkFlatProduction",
-        )
+    # ------------------------------------------------------------
+    # Phase 3: dark-flats (library reuse or capture)
+    # ------------------------------------------------------------
 
-        dark_started = time.time()
+    darkflat_files = []
+    library_dir = None
+    darkflats_pending = False
 
-        result = dbus(
-            "start",
-            TRAIN
-        )
-
-        print(
-            f"Ekos start: {result}"
-        )
-
-        wait_for_completion()
-
-        darkflat_files = verify_new_darkflats(
-            dark_dir,
-            config["frames"][
-                "flats_per_group"
-            ],
-            dark_started,
-            args.session,
-            exposure,
+    if config[
+        "frames"
+    ].get(
+        "darkflats_enabled",
+        True
+    ):
+        darkflat_files, library_dir, darkflats_pending = acquire_darkflats(
+            session=args.session,
+            profile=profile,
+            camera=camera,
+            gain=gain,
+            offset=offset,
+            xbin=xbin,
+            ybin=ybin,
+            rotsteps=rotsteps,
+            exposure=exposure,
+            probe_file=probe_file,
+            config=config,
         )
 
     group_root = build_group_root(
@@ -1922,12 +2552,17 @@ def main():
         xbin=xbin,
         ybin=ybin,
         rotsteps=rotsteps,
-        brightness=int(
-            profile_data["brightness"]
-        ),
+        brightness=brightness,
         exposure=exposure,
         flat_files=flat_files,
         darkflat_files=darkflat_files,
+        flat_levels=dict(
+            flat_levels,
+            frame_count=count_details,
+        ),
+        target_adu=target_adu,
+        darkflat_library=library_dir,
+        darkflats_pending=darkflats_pending,
     )
 
     print()
@@ -1935,30 +2570,36 @@ def main():
     print("CALIBRATION GROUP COMPLETE")
     print("=" * 72)
     print(
-        f"Session:  {args.session}"
+        f"Session:    {args.session}"
     )
     print(
-        f"Profile:  {profile}"
+        f"Profile:    {profile}"
     )
     print(
-        f"Exposure: {exposure:.7f} s"
+        f"Exposure:   {exposure:g} s"
     )
     print(
-        f"Flats:    {flat_dir}"
+        f"Brightness: {brightness}"
+    )
+    print(
+        f"Flats:      {flat_dir}"
     )
 
-    if config[
-        "frames"
-    ].get(
-        "darkflats_enabled",
-        True
-    ):
+    if darkflats_pending:
         print(
-            f"Darkflats: {dark_dir}"
+            f"Dark-flats: PENDING (library not built): {library_dir}"
+        )
+    elif darkflat_files:
+        print(
+            "Dark-flats: "
+            + str(
+                library_dir
+                if library_dir is not None
+                else Path(darkflat_files[0]).parent
+            )
         )
 
     print("=" * 72)
-
 
 if __name__ == "__main__":
     try:

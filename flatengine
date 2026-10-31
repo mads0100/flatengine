@@ -14,6 +14,8 @@ Usage:
   flatengine nightly [options]
   flatengine calibrate [options]
   flatengine execute [options]
+  flatengine darks [options]
+  flatengine catalog [options]
   flatengine regression
   flatengine doctor
   flatengine stamp [options]
@@ -42,6 +44,12 @@ case "${cmd}" in
         ;;
     execute)
         exec python3 "${SCRIPT_DIR}/flats-execute.py" "$@"
+        ;;
+    darks|darkflats)
+        exec python3 "${SCRIPT_DIR}/flat-darkflats.py" "$@"
+        ;;
+    catalog)
+        exec python3 "${SCRIPT_DIR}/flat-catalog.py" "$@"
         ;;
     regression)
         exec python3 "${SCRIPT_DIR}/flats-regression.py" "$@"

@@ -367,15 +367,21 @@ def main():
             14
         )
 
-        ceiling = (2 ** bits) - 1
-
-        target_adu = round(
-            ceiling * fraction
+        target_adu, tol_fraction, _, _ = fc.flat_targets(
+            config,
+            bits,
         )
 
         tolerance = round(
             target_adu
-            * tolerance_fraction
+            * tol_fraction
+        )
+
+        ladder = fc.exposure_ladder(config)
+
+        planned_exposure = fc.snap_to_ladder(
+            profile_data.get("flat_exposure"),
+            ladder,
         )
 
         brightness = profile_data.get(
@@ -416,11 +422,14 @@ def main():
         print()
         print(
             f"Target ADU:   "
-            f"{target_adu} ± {tolerance}"
+            f"{target_adu} ± {tolerance} "
+            "(brightest CFA channel)"
         )
         print(
-            f"Preferred:    "
-            f"{preferred:.2f} s"
+            f"Exposure:     "
+            f"{planned_exposure:g} s (ladder: "
+            + ", ".join(f"{step:g}" for step in ladder)
+            + " s)"
         )
         print(
             f"Brightness:   {brightness}"
@@ -454,10 +463,19 @@ def main():
             / "flats"
         )
 
-        darkflat_dir = (
-            group_root
-            / "darkflats"
-        )
+        if config.get(
+            "darkflat_library",
+            {},
+        ).get("enabled", True):
+            darkflat_dir = (
+                fc.darkflat_library_root(config)
+                / f"<camera state>_E{planned_exposure:g}s"
+            )
+        else:
+            darkflat_dir = (
+                group_root
+                / "darkflats"
+            )
 
         print()
         print(
@@ -487,7 +505,7 @@ def main():
                 f"Dark-flat:    {darkflat_dir}"
             )
 
-            if isinstance(last_exposure, (int, float)):
+            if isinstance(planned_exposure, (int, float)):
                 darkflat_example = render_darkflat_filename(
                     config=config,
                     session=selected_session,
@@ -496,7 +514,7 @@ def main():
                     offset=offset,
                     xbin=xbin,
                     ybin=ybin,
-                    exposure=last_exposure,
+                    exposure=planned_exposure,
                     seq=1,
                 )
 

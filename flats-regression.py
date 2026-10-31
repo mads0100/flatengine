@@ -191,12 +191,492 @@ def cleanup_rotsteps_test():
         )
 
 
+def check(condition, label):
+    if not condition:
+        raise RuntimeError(f"{label} FAILED")
+
+    print(f"PASS: {label}")
+
+
+def fixed_exposure_checks():
+    """
+    Hardware-free checks for fixed-exposure tuning and the
+    dark-flat library helpers.
+    """
+    import tempfile
+
+    import numpy as np
+
+    config = {
+        "output": {"root": "/tmp/flatengine-unused"},
+        "exposure_policy": {"minimum_seconds": 1.0},
+        "flat_target": {},
+        "darkflat_library": {},
+    }
+
+    ladder = fc.exposure_ladder(config)
+
+    check(
+        ladder[0] == 1.0 and 0.5 not in ladder,
+        "ladder never goes below 1 s",
+    )
+
+    target, tol, cap, floor = fc.flat_targets(config, 14)
+
+    check(
+        target == round(16383 * 0.64) and cap == round(16383 * 0.8),
+        "14-bit targets",
+    )
+
+    # Synthetic GBRG flat: greens 10000, blue 6000, red 4000.
+    raw = np.zeros((400, 600), dtype=np.uint16)
+    raw[0::2, 0::2] = 10000
+    raw[1::2, 1::2] = 10000
+    raw[0::2, 1::2] = 6000
+    raw[1::2, 0::2] = 4000
+
+    levels = fc.cfa_levels(raw, ceiling=16383)
+
+    check(
+        levels["brightest"] == 10000 and levels["weakest"] == 4000,
+        "CFA levels independent of Bayer pattern",
+    )
+
+    # Simulated panels: linear, and nonlinear with a dim filter.
+    def simulate(adu_per_unit_second, power, start_b, start_e):
+        b, e = start_b, start_e
+        blocked = set()
+
+        for _ in range(12):
+            measured = adu_per_unit_second * (b ** power) * e
+
+            done, b, e = fc.tuning_step(
+                b, e, {"brightest": measured}, target, tol, cap,
+                ladder, 1, 255, 1, blocked=blocked,
+            )
+
+            if done:
+                return b, e
+
+        raise RuntimeError("did not converge")
+
+    b, e = simulate(80.0, 1.0, 128, 1.0)
+    check(e == 1.0, f"broadband converges at 1 s (brightness {b})")
+
+    b, e = simulate(80.0, 1.0, 128, 5.0)
+    check(e == 1.0, "steps back down to 1 s when the panel can")
+
+    # Dim filter on a nonlinear panel: full brightness needs about
+    # 15 s, so the shortest workable ladder step is 20 s.
+    b, e = simulate(1.2, 1.15, 200, 1.0)
+    check(e == 20.0, f"narrowband steps up to 20 s (brightness {b})")
+
+    b, e = simulate(1.2, 1.15, 200, 60.0)
+    check(e == 20.0, f"narrowband steps down to 20 s (brightness {b})")
+
+    # With the floor: a filter that reaches only ~6,000 ADU at full
+    # brightness in 1 s is accepted at 1 s instead of stepping to 2 s.
+    floor = fc.flat_floor({"flat_target": {}}, 14)
+
+    def simulate_floor(adu_per_unit_second, start_b, start_e):
+        b, e = start_b, start_e
+        blocked = set()
+        measured = None
+
+        for _ in range(12):
+            measured = min(16383, adu_per_unit_second * b * e)
+
+            done, b, e = fc.tuning_step(
+                b, e, {"brightest": measured}, target, tol, cap,
+                ladder, 1, 255, 1, blocked=blocked, floor=floor,
+            )
+
+            if done:
+                return b, e, measured
+
+        raise RuntimeError("did not converge")
+
+    b, e, m = simulate_floor(6000 / 255, 128, 1.0)
+    check(
+        e == 1.0 and b == 255 and floor <= m < target,
+        f"floor holds 1 s at {m:.0f} ADU instead of stepping up",
+    )
+
+    b, e, m = simulate_floor(6000 / 255, 128, 5.0)
+    check(e == 1.0, "floor steps back down to 1 s from a long exposure")
+
+    b, e, m = simulate_floor(3000 / 255, 128, 1.0)
+    check(
+        e == 2.0 and m >= floor,
+        f"below the floor at 1 s still steps up ({e:g} s, {m:.0f} ADU)",
+    )
+
+    # Dual-band: brightest clears the floor but red is tiny, so the
+    # weak-channel minimum blocks below-target acceptance.
+    done, b, e = fc.tuning_step(
+        255, 10.0, {"brightest": 4482, "weakest": 465}, target, tol,
+        cap, ladder, 1, 255, 1, blocked=set(), floor=floor,
+        weak_floor=1044,
+    )
+    check(
+        not done and e > 10.0,
+        f"weak dual-band channel overrides the floor (next {e:g} s)",
+    )
+
+    done, b, e = fc.tuning_step(
+        255, 1.0, {"brightest": 6000, "weakest": 2300}, target, tol,
+        cap, ladder, 1, 255, 1, blocked=set(), floor=floor,
+        weak_floor=1044,
+    )
+    check(done and e == 1.0, "broadband below target is still accepted at 1 s")
+
+    check(
+        abs(fc.additive_error_percent({"weakest": 1044}, 2.0, 44) - 0.2) < 1e-9,
+        "additive-error sensitivity at 1,000 ADU above pedestal is 0.2%",
+    )
+
+    # Library naming is stable for small temperature jitter.
+    a = fc.darkflat_library_dir(
+        config, "ToupTek SkyEye45AC-plus", 100, 40, 1, 1, 1.0,
+        lownoise="ON", ccd_temp=-10.6,
+    )
+    b_dir = fc.darkflat_library_dir(
+        config, "ToupTek SkyEye45AC-plus", 100, 40, 1, 1, 1.0,
+        lownoise="ON", ccd_temp=-9.8,
+    )
+
+    check(a == b_dir, "library key tolerates CCD-TEMP jitter")
+    check(a.name.endswith("_E1s"), "library key carries exposure")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        files = []
+
+        for index in range(3):
+            path = tmp / f"df_{index}.fits"
+            path.write_bytes(b"x")
+            files.append(path)
+
+        check(
+            fc.library_files(tmp, 3) is None,
+            "library without manifest is not reused",
+        )
+
+        fc.write_library_manifest(tmp, files, 1.0, {})
+
+        check(
+            fc.library_files(tmp, 3) == files,
+            "complete library is reused",
+        )
+
+        check(
+            fc.library_files(tmp, 4) is None,
+            "short library is not reused",
+        )
+
+    count_cfg = {
+        "frames": {
+            "flats_per_group": 30,
+            "flats_max_per_group": 100,
+            "flat_min_snr": 200,
+            "e_per_adu": 0.91,
+            "pedestal_adu": 44,
+        }
+    }
+
+    count, _ = fc.flat_frame_count(
+        {"brightest": 10500, "weakest": 4194}, count_cfg,
+    )
+    check(count == 30, "broadband flat keeps the base count")
+
+    count, details = fc.flat_frame_count(
+        {"brightest": 10500, "weakest": 1000}, count_cfg,
+    )
+    check(
+        40 <= count <= 50 and details["master_snr"] >= 200,
+        f"weak red channel raises the count ({count} frames)",
+    )
+
+    count, details = fc.flat_frame_count(
+        {"brightest": 10500, "weakest": 200}, count_cfg,
+    )
+    check(
+        count == 100 and details["capped"],
+        "very weak channel is capped at the maximum",
+    )
+
+    # Pending dark-flat records and Pushover, isolated in a temp dir.
+    import io
+    import json as _json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = fc.PENDING_FILE
+        fc.PENDING_FILE = Path(tmp) / "pending.json"
+
+        try:
+            details = {"exposure": 30.0, "gain": 100, "offset": 40,
+                       "xbin": 1, "ybin": 1, "count": 30}
+
+            _, due = fc.record_pending_darkflats(
+                Path(tmp) / "lib30", details, "20261025",
+            )
+            check(due, "first pending request notifies")
+
+            record, due = fc.record_pending_darkflats(
+                Path(tmp) / "lib30", details, "20261026",
+            )
+            check(
+                not due and record["sessions"] == ["20261025", "20261026"],
+                "repeat request within window does not re-notify",
+            )
+
+            check(
+                fc.clear_pending(Path(tmp) / "lib30")
+                and fc.load_pending() == {},
+                "building a library clears its request",
+            )
+        finally:
+            fc.PENDING_FILE = saved
+
+    # Calibration catalog: source of truth when files have moved.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        saved_catalog = fc.CATALOG_FILE
+        fc.CATALOG_FILE = tmp / "catalog.json"
+
+        try:
+            cat_cfg = {
+                "output": {"root": str(tmp / "cal")},
+                "calibration_catalog": {"max_age_days": 365},
+            }
+
+            hdr = fits.Header()
+            hdr["INSTRUME"] = "ToupTek SkyEye45AC-plus"
+            hdr["GAIN"] = 100
+            hdr["OFFSET"] = 40
+            hdr["XBINNING"] = 1
+            hdr["YBINNING"] = 1
+            hdr["EXPTIME"] = 120.0
+            hdr["LOWNOISE"] = "ON"
+            hdr["CCD-TEMP"] = -10.3
+            hdr["FIRMVER"] = "4.1.2"
+
+            key, rec = fc.dark_record_from_header(hdr, cat_cfg)
+
+            check(
+                fc.catalog_check(key, 30, cat_cfg)[1] == "missing",
+                "uncataloged set is reported missing",
+            )
+
+            fc.catalog_register(
+                key, dict(rec, count=50, location="moved to PC"),
+            )
+
+            check(
+                fc.catalog_check(key, 30, cat_cfg, firmware="4.1.2")[1] is None,
+                "cataloged set is usable with no files on disk",
+            )
+
+            check(
+                "frames" in fc.catalog_check(key, 60, cat_cfg)[1],
+                "too few cataloged frames is reported",
+            )
+
+            check(
+                "firmware" in fc.catalog_check(
+                    key, 30, cat_cfg, firmware="4.2.0")[1],
+                "firmware change marks the set stale",
+            )
+
+            fc.catalog_register(key, dict(rec, count=50, built="2020-01-01"))
+
+            check(
+                "older than" in fc.catalog_check(key, 30, cat_cfg)[1],
+                "old set is reported stale",
+            )
+
+            # Lights in a synthetic session drive the requirements.
+            lights = tmp / "Pictures" / "M33"
+            lights.mkdir(parents=True)
+
+            for index in range(3):
+                light = hdr.copy()
+                light["IMAGETYP"] = "Light Frame"
+                light["SESSION"] = "20991231"
+                fits.PrimaryHDU(
+                    np.zeros((4, 4), dtype=np.uint16), light,
+                ).writeto(lights / f"light_{index}.fits")
+
+            fc.catalog_register(key, dict(rec, count=50))
+
+            results = fc.light_dark_requirements(
+                tmp / "Pictures", "20991231", cat_cfg,
+            )
+
+            check(
+                len(results) == 1 and results[0][2] is None
+                and results[0][3] == 3,
+                "lights find their cataloged darks",
+            )
+
+            fc.catalog_remove(key)
+
+            results = fc.light_dark_requirements(
+                tmp / "Pictures", "20991231", cat_cfg,
+            )
+
+            check(
+                results[0][2] == "missing",
+                "lights without darks are flagged",
+            )
+
+            # Old-state darks exist: the reason names the differences.
+            old_state = hdr.copy()
+            old_state["OFFSET"] = 0
+            old_state["LOWNOISE"] = "OFF"
+            old_key, old_rec = fc.dark_record_from_header(old_state, cat_cfg)
+            fc.catalog_register(old_key, dict(old_rec, count=30))
+
+            reason = fc.light_dark_requirements(
+                tmp / "Pictures", "20991231", cat_cfg,
+            )[0][2]
+
+            check(
+                "OFFSET 0 -> 40" in reason and "LOWNOISE OFF -> ON" in reason,
+                f"mismatch is explained ({reason})",
+            )
+
+            # Extra keywords join the match when configured.
+            extra_cfg = dict(cat_cfg, calibration_catalog={
+                "max_age_days": 365,
+                "extra_match_keywords": ["READMODE"],
+            })
+            hcg = hdr.copy()
+            hcg["READMODE"] = "HCG"
+            lcg = hdr.copy()
+            lcg["READMODE"] = "LCG"
+            k_hcg, _ = fc.dark_record_from_header(hcg, extra_cfg)
+            k_lcg, r_lcg = fc.dark_record_from_header(lcg, extra_cfg)
+
+            check(k_hcg != k_lcg, "extra keyword separates catalog keys")
+
+            fc.catalog_register(k_lcg, dict(r_lcg, count=30))
+            _, r_hcg = fc.dark_record_from_header(hcg, extra_cfg)
+
+            check(
+                "READMODE LCG -> HCG" in fc.catalog_check(
+                    k_hcg, 30, extra_cfg, want=r_hcg)[1],
+                "extra keyword mismatch is explained",
+            )
+        finally:
+            fc.CATALOG_FILE = saved_catalog
+
+    # Custom keyword stamping from INDI, using the SkyEye45AC-plus
+    # property names, with INDI faked.
+    def fake_indi(pattern):
+        props = {
+            "ToupTek SkyEye45AC-plus.TC_CONVERSION_GAIN.GAIN_LOW": "Off",
+            "ToupTek SkyEye45AC-plus.TC_CONVERSION_GAIN.GAIN_HIGH": "On",
+            "ToupTek SkyEye45AC-plus.CCD_CONTROLS.Gain": "100",
+        }
+        prefix = pattern.rstrip("*").rstrip(".")
+        return "\n".join(
+            f"{k}={v}" for k, v in props.items() if k.startswith(prefix)
+        )
+
+    stamp_cfg = {"stamp_keywords": {
+        "CONVGAIN": {
+            "indi_switch": "ToupTek SkyEye45AC-plus.TC_CONVERSION_GAIN",
+            "map": {"GAIN_HIGH": "HCG", "GAIN_LOW": "LCG"},
+            "comment": "Conversion gain mode",
+        },
+        "CAMGAIN": {"indi": "ToupTek SkyEye45AC-plus.CCD_CONTROLS.Gain"},
+        "SITE": {"value": "Woodbury MN"},
+        "MISSING": {"indi_switch": "Nope.NOPE"},
+    }}
+
+    values, problems = fc.resolve_stamp_keywords(stamp_cfg, indi_runner=fake_indi)
+
+    check(values["CONVGAIN"][0] == "HCG", "INDI switch stamped as HCG")
+    check(values["CAMGAIN"][0] == 100, "INDI number stamped")
+    check(values["SITE"][0] == "Woodbury MN", "constant stamped")
+    check(
+        "MISSING" not in values and len(problems) == 1,
+        "unreadable source is skipped, not fatal",
+    )
+
+    stamped = fc.stamp_header(fits.Header(), values)
+    check(
+        stamped["CONVGAIN"] == "HCG"
+        and stamped.comments["CONVGAIN"] == "Conversion gain mode",
+        "keyword and comment written to header",
+    )
+
+    sent = {}
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_open(request, timeout=10):
+        sent["data"] = request.data.decode()
+        return FakeResponse(_json.dumps({"status": 1}).encode())
+
+    push_cfg = {"notify": {"pushover": {"user_key": "u1", "app_token": "t1"}}}
+
+    check(
+        fc.notify(push_cfg, "Title", "Body", opener=fake_open)
+        and "user=u1" in sent["data"] and "token=t1" in sent["data"],
+        "Pushover request carries credentials",
+    )
+
+    for name in ("FLATENGINE_PUSHOVER_USER", "FLATENGINE_PUSHOVER_TOKEN"):
+        os.environ.pop(name, None)
+
+    check(
+        not fc.notify({}, "Title", "Body", opener=fake_open),
+        "missing Pushover credentials degrade to printing",
+    )
+
+    def failing_open(request, timeout=10):
+        raise OSError("network down")
+
+    check(
+        not fc.notify(push_cfg, "Title", "Body", opener=failing_open),
+        "Pushover failure does not raise",
+    )
+
+    rng = np.random.default_rng(1)
+    clean = rng.normal(44, 1.5, (600, 900))
+
+    yy, xx = np.mgrid[0:600, 0:900]
+    vignette = 1 - 0.3 * (((yy - 300) / 300) ** 2 + ((xx - 450) / 450) ** 2)
+    leaked = clean + 20 * vignette
+    leaked[1::2, 0::2] += 10
+
+    check(
+        not fc.light_leak_report(clean)["suspected"],
+        "clean dark passes leak check",
+    )
+
+    check(
+        fc.light_leak_report(leaked)["suspected"],
+        "leaked dark is flagged",
+    )
+
+
 def main():
     print("=" * 72)
     print("FLAT ENGINE REGRESSION")
     print("=" * 72)
 
     try:
+        fixed_exposure_checks()
+
         # ----------------------------------------------------
         # 1. Syntax checks
         # ----------------------------------------------------
@@ -207,6 +687,12 @@ def main():
             PLAN,
             EXEC,
             NIGHTLY,
+            ROOT / "session-postcapture.py",
+            ROOT / "flat_common.py",
+            ROOT / "flat-calibrate.py",
+            ROOT / "flat-setup.py",
+            ROOT / "flat-darkflats.py",
+            ROOT / "flat-catalog.py",
         ])
 
         print("PASS: Python syntax")

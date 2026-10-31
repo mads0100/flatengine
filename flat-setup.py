@@ -20,19 +20,57 @@ DEFAULTS = {
 
     "flat_target": {
         "mode": "fraction",
+        # Ekos ADU target used only by `flatengine calibrate`.
         "fraction": 0.50,
         "tolerance_fraction": 0.05,
+        # Nightly tuning targets the brightest Bayer channel.
+        "brightest_channel_fraction": 0.64,
+        # At full panel brightness, accept the brightest channel down
+        # to this fraction before lengthening the exposure; the
+        # adaptive frame count makes up the signal. 0 disables.
+        "min_brightest_fraction": 0.25,
+        "saturation_cap_fraction": 0.80,
+        "weakest_channel_min_adu": 1000,
+        "max_tuning_attempts": 8,
     },
 
     "exposure_policy": {
         "preferred_seconds": 1.0,
-        "minimum_seconds": 0.5,
+        # Rolling-shutter guard: never shoot flats shorter.
+        "minimum_seconds": 1.0,
         "maximum_preferred_seconds": 5.0,
         "if_longer_required": "accept_and_warn",
+        # Standard flat exposures. The panel is tuned at the
+        # shortest step; longer steps are used only when the
+        # panel cannot get bright enough (narrowband filters).
+        "ladder_seconds": [1, 2, 3, 5, 10, 20, 30, 60],
+    },
+
+    "darkflat_library": {
+        "enabled": True,
+        # "notify": record a missing library, send a Pushover
+        # message and continue without dark-flats; build later
+        # with `flatengine darkflats --build`.
+        # "capture": shoot the missing library immediately.
+        "on_missing": "notify",
+        # Empty means <output root>/DarkFlatLibrary.
+        "root": "",
+        "frames": 30,
+        "temperature_step_c": 5,
+        "leak_threshold_adu": 5.0,
     },
 
     "frames": {
+        # Minimum flats per group.
         "flats_per_group": 30,
+        # The count rises until the WEAKEST Bayer channel's master
+        # flat reaches flat_min_snr, up to flats_max_per_group.
+        "flats_max_per_group": 100,
+        "flat_min_snr": 200,
+        # Camera conversion gain at the flat gain setting
+        # (SkyEye45AC-plus HCG gain 100: 0.91).
+        "e_per_adu": 1.0,
+        "pedestal_adu": 0,
         "darkflats_enabled": True,
     },
 
@@ -41,8 +79,43 @@ DEFAULTS = {
         "device": "Flip Flat",
         "can_power": True,
         "can_set_brightness": True,
-        "brightness_min": 0,
+        "brightness_min": 1,
         "brightness_max": 255,
+        "brightness_step": 1,
+    },
+
+    "calibration_catalog": {
+        # The catalog (~/.config/flatengine/calibration-catalog.json)
+        # records which dark sets exist, so files can be moved to a
+        # processing machine without FlatEngine re-requesting them.
+        "check_light_darks": True,
+        "light_dark_frames": 30,
+        # Ask for a rebuild after this many days; 0 disables.
+        "max_age_days": 365,
+        # Empty means <output root>/DarkLibrary.
+        "darks_root": "",
+        # Extra FITS keywords that must match between lights and
+        # darks, if your driver records more camera state
+        # (e.g. a readout or conversion-gain mode).
+        "extra_match_keywords": [],
+    },
+
+    # Custom FITS keywords stamped into every frame by the Ekos
+    # post-capture script and into FlatEngine's own captures.
+    # Sources: "value", "indi" (Device.PROP.ELEMENT), "indi_switch"
+    # (Device.PROP, with optional "map"), or "command".
+    "stamp_keywords": {},
+
+    "notify": {
+        # Pushover credentials. FLATENGINE_PUSHOVER_USER and
+        # FLATENGINE_PUSHOVER_TOKEN environment variables also work.
+        "pushover": {
+            "enabled": True,
+            "user_key": "",
+            "app_token": "",
+        },
+        # Re-send a pending dark-flat reminder at most this often.
+        "repeat_hours": 24,
     },
 
     "capabilities": {
@@ -335,7 +408,7 @@ def main():
     config["exposure_policy"][
         "minimum_seconds"
     ] = ask_float(
-        "Minimum acceptable flat exposure",
+        "Minimum flat exposure (rolling-shutter guard; 1.0 recommended)",
         config["exposure_policy"][
             "minimum_seconds"
         ],

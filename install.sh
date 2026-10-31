@@ -87,6 +87,8 @@ scripts=(
     flats-plan.py
     flats-execute.py
     flats-nightly.py
+    flat-darkflats.py
+    flat-catalog.py
     flats-regression.py
     flat-doctor.py
     session-stamp.py

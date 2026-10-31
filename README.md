@@ -165,12 +165,196 @@ For each required group, FlatEngine:
 2. Moves the rotator if ROTSTEPS metadata exists
 3. Verifies rotation using ROTATANG
 4. Closes the flat panel
-5. Sets panel brightness
-6. Runs an ADU probe
-7. Captures fixed-exposure flats
-8. Captures matching dark-flats
-9. Verifies FITS metadata
-10. Writes a completion manifest
+5. Tunes panel brightness with fixed-exposure probes
+6. Captures fixed-exposure flats
+7. Reuses or builds a dark-flat library for that exposure
+8. Verifies FITS metadata
+9. Writes a completion manifest
+
+## Fixed-Exposure Flats
+
+Flats are shot at a fixed exposure from a short ladder of standard
+steps (`exposure_policy.ladder_seconds`, default 1, 2, 3, 5, 10, 20,
+30, 60 s). FlatEngine adjusts the panel brightness, not the
+exposure, to hit the target.
+
+    probe at learned brightness and ladder exposure
+        ->
+    measure the brightest Bayer channel
+        ->
+    adjust brightness proportionally (damped for LED nonlinearity)
+        ->
+    panel at maximum and still too dim? step up the ladder
+        ->
+    shortest exposure the panel can serve is always preferred
+
+Why:
+
+- Exposures never drop below `exposure_policy.minimum_seconds`
+  (default 1.0 s), avoiding rolling-shutter banding.
+- Standard steps keep dark-flats reusable across sessions.
+- Broadband filters land on 1 s; narrowband filters such as an
+  L-Extreme step up the ladder automatically.
+
+The target is the median of the brightest 2x2 Bayer position
+(`flat_target.brightest_channel_fraction`, default 0.64 of full
+scale, about 10,500 ADU on a 14-bit camera), measured over the
+central 80% of the frame. It does not depend on BAYERPAT, which
+some drivers write incorrectly. A saturation cap
+(`saturation_cap_fraction`, default 0.80) is enforced, and a
+warning is printed when the weakest channel falls under
+`weakest_channel_min_adu` (default 1000).
+
+When the panel is already at full brightness and the brightest
+channel is below target but at least `min_brightest_fraction` of
+full scale (default 0.25, about 4,100 ADU at 14-bit), FlatEngine
+accepts that level and keeps the shorter exposure instead of
+stepping up the ladder, so most filters stay at 1 s with one
+dark-flat library. The weakest channel must still clear
+`weakest_channel_min_adu` (default 1000) above the pedestal; through
+a dual-band filter, whose red or blue is very weak, that keeps the
+full target and the normal ladder. Each run prints a flat level analysis, including
+how large a 2 ADU calibration error would be relative to the
+weakest channel, and warns above 0.2%. Set the fraction to 0 to
+always reach the full target.
+
+The flat count adapts to the weakest Bayer channel. Master-flat
+signal-to-noise grows with the square root of the electrons
+collected, so FlatEngine shoots
+
+    frames = flat_min_snr^2 / (weakest ADU x e_per_adu)
+
+clamped between `frames.flats_per_group` (minimum, default 30) and
+`frames.flats_max_per_group` (default 100). With the default SNR of
+200 and 0.91 e-/ADU, a broadband flat stays at 30 frames while a
+dual-band flat whose red channel sits near 1,000 ADU gets about 44.
+Set `e_per_adu` and `pedestal_adu` for your camera.
+
+The tuned brightness and exposure are saved to the filter profile
+(`brightness`, `flat_exposure`), so the next session's first probe
+usually lands in tolerance. A profile is no longer required before
+the first run: tuning starts at mid-range brightness.
+
+## Dark-Flat Library
+
+Dark-flats depend only on exposure and camera state, not on the
+optics, so FlatEngine keeps them in a library instead of shooting a
+set for every group:
+
+    <output root>/DarkFlatLibrary/
+        <camera>_G<gain>_O<offset>_B<x>x<y>_LN<lownoise>_T<temp>C_E<exp>s/
+            *_DarkFlat_*.fits
+            library.json
+
+The key includes CCD temperature rounded to
+`darkflat_library.temperature_step_c` (default 5 C) and the
+LOWNOISE header value when the driver writes one. A complete library
+is reused; a missing one is captured once.
+
+Every new capture is checked for light leaks: Bayer channels that
+differ, or a center brighter than the corners, by more than
+`darkflat_library.leak_threshold_adu` (default 5 ADU). A suspected
+leak aborts the run and the frames are NOT registered. Build
+libraries after dark, with the front end covered.
+
+Set `darkflat_library.enabled` to false to restore per-group
+dark-flats.
+
+### Missing libraries: notify instead of capture
+
+By default (`darkflat_library.on_missing: "notify"`) a nightly run
+does **not** shoot a missing library unattended. It finishes the
+flats, records the request, and sends a Pushover message such as:
+
+    FlatEngine: dark-flats needed
+    Shoot 30 x 30 s  G100 O40 B1x1  LowNoise ON  ~-10 C.
+    After dark, front end covered: flatengine darks --build
+
+The group's manifest records `darkflats_pending: true`. Set
+`on_missing: "capture"` to shoot missing libraries immediately.
+
+Manage the library with:
+
+    flatengine darks                        # list pending
+    flatengine darks --build                # capture all pending
+    flatengine darks --build --exposure 30  # just one
+    flatengine darks --add 1 2 30 --like some_flat.fits
+                                                # pre-request libraries
+    flatengine darks --test-notify          # check Pushover
+
+`--build` asks for confirmation that it is dark and the front end
+is covered, verifies the captured frames match the requested camera
+state (gain, offset, LOWNOISE, temperature band), runs the leak
+check, and registers the library only if everything passes.
+
+## Calibration Catalog
+
+A capture computer usually hands its calibration files to a
+processing machine, so FlatEngine does not rely on finding dark
+files on disk. It keeps a catalog of which dark sets exist:
+
+    ~/.config/flatengine/calibration-catalog.json
+
+Each entry records camera, gain, offset, binning, LOWNOISE,
+temperature band, exposure, frame count, build date, firmware and
+where the files went. Darks for lights and dark-flats share the
+catalog, because a dark-flat is simply a dark at the flat exposure.
+
+- Sets built by `flatengine darks --build` are cataloged
+  automatically.
+- Darks shot another way (Ekos, another computer): run
+  `flatengine catalog scan DIR` before moving them. It reads the
+  FITS headers, counts frames (a stacked master counts as its
+  NCOMBINE), and registers each set.
+- Or register one by hand:
+  `flatengine catalog add --like frame.fits --exposure 120 --count 50`.
+
+Every nightly run checks each light group's dark needs (exposure,
+gain, offset, binning, low noise, temperature band) and each flat
+exposure against the catalog. A set that is missing, has too few
+frames, is older than `calibration_catalog.max_age_days` (default
+365), or was shot on different camera firmware is recorded as
+pending and announced by Pushover, e.g.:
+
+    FlatEngine: darks needed for lights
+    [light dark] 30 x 120 s  G100 O40 B1x1  LowNoise ON  ~-10 C (missing)
+
+Requirements are read from the FITS headers of the lights (and of
+that night's flat probe for dark-flats), and compared against the
+headers recorded for each cataloged set. When no set matches, the
+message names how the closest set differs, for example:
+
+    missing; closest cataloged set differs: OFFSET 0 -> 40, LOWNOISE OFF -> ON
+
+If your driver records more camera state (a readout or
+conversion-gain mode), add those keywords to
+`calibration_catalog.extra_match_keywords` and they become part of
+the match.
+
+Useful commands:
+
+    flatengine catalog                 # list sets and their status
+    flatengine catalog check           # latest session's lights vs catalog
+    flatengine darks                   # pending sets
+    flatengine darks --build           # shoot pending sets (after dark)
+
+### Pushover
+
+Add credentials to `flat-config.json`:
+
+    "notify": {
+      "pushover": {
+        "user_key": "<your user key>",
+        "app_token": "<your application token>"
+      },
+      "repeat_hours": 24
+    }
+
+or set `FLATENGINE_PUSHOVER_USER` and `FLATENGINE_PUSHOVER_TOKEN`.
+Without credentials, notifications are printed instead. Pending
+reminders repeat at most every `repeat_hours`. FlatEngine also
+notifies on a light-leak rejection, on a nightly abort, and when
+libraries finish building. A failed notification never stops a run.
 
 ## Manual Filters
 
@@ -362,6 +546,41 @@ Regression tests do not move hardware.
     flatengine regression
     flatengine doctor
     flatengine stamp --help
+
+## Custom FITS Keywords
+
+INDI drivers decide which camera state reaches the FITS header, and
+many controls (conversion gain, readout modes) never do. FlatEngine
+lets you build your own: `stamp_keywords` in `flat-config.json` maps
+FITS keywords to a source, and every frame gets them.
+
+    "stamp_keywords": {
+      "CONVGAIN": {
+        "indi_switch": "ToupTek SkyEye45AC-plus.TC_CONVERSION_GAIN",
+        "map": {"GAIN_HIGH": "HCG", "GAIN_LOW": "LCG"},
+        "comment": "Conversion gain mode"
+      }
+    }
+
+Sources:
+
+- `"value"`: a constant
+- `"indi"`: one INDI element, `Device.PROPERTY.ELEMENT`
+- `"indi_switch"`: an INDI switch property, `Device.PROPERTY`; the
+  element that is On, optionally renamed through `"map"`
+- `"command"`: first line of a command's output
+
+`session-postcapture.py` stamps them into each frame Ekos captures,
+and FlatEngine stamps the same values into the probes, flats and
+dark sets it captures. A source that cannot be read is skipped with
+a warning; it never blocks capture. To make a stamped keyword part
+of dark matching, add it to `calibration_catalog.extra_match_keywords`:
+
+    "calibration_catalog": {
+      "extra_match_keywords": ["CONVGAIN"]
+    }
+
+Keywords are limited to 8 characters (FITS standard).
 
 ## Ekos Post-Capture Integration
 

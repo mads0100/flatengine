@@ -949,13 +949,17 @@ def main():
     parser.add_argument(
         "--min-exposure",
         type=float,
-        default=0.8,
+        default=1.0,
+        help=(
+            "Shortest acceptable exposure. Keep at 1.0 s or "
+            "longer to avoid rolling-shutter banding."
+        ),
     )
 
     parser.add_argument(
         "--max-exposure",
         type=float,
-        default=1.2,
+        default=1.25,
     )
 
     parser.add_argument(
